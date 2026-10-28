@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Read Aloud</string>
+    <string name="service_label">Read Aloud page reader</string>
+    <string name="service_description">Reads the text on the current ebook page out loud with your text-to-speech voice, then turns the page and keeps going. Shows a small play/pause control while you are in your reading app.</string>
+    <color name="icon_bg">#2E5E4E</color>
+</resources>
