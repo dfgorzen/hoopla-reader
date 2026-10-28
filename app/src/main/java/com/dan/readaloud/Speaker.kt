@@ -7,17 +7,27 @@ import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 
-/** Thin wrapper over TextToSpeech: speak a page, get one callback when it's all spoken. */
+/**
+ * Speaks a page as one utterance per sentence, reporting progress on the main thread:
+ * sentence start/done, word ranges (if the TTS engine supports it), and page done.
+ */
 class Speaker(context: Context, private val onReady: (Boolean) -> Unit) : UtteranceProgressListener() {
+    interface Listener {
+        fun onSegmentStart(index: Int)
+        fun onSegmentDone(index: Int)
+        fun onWord(index: Int, start: Int, end: Int)
+        fun onAllDone()
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private val tts: TextToSpeech
 
     var ready = false
         private set
 
-    @Volatile private var lastId: String? = null
-    private var doneCallback: (() -> Unit)? = null
     private var batch = 0
+    private var count = 0
+    private var listener: Listener? = null
 
     init {
         // Post: on failure the listener can fire synchronously inside the constructor.
@@ -38,27 +48,26 @@ class Speaker(context: Context, private val onReady: (Boolean) -> Unit) : Uttera
         onReady(ready)
     }
 
-    fun speak(text: String, rate: Float, onFinished: () -> Unit) {
+    fun speak(parts: List<String>, rate: Float, l: Listener) {
         stop()
         if (!ready) return
         batch++
         val b = batch
-        doneCallback = onFinished
-        val parts = TextUtil.chunks(text, CHUNK)
+        listener = l
+        count = parts.size
         if (parts.isEmpty()) {
-            main.post { if (b == batch) finish() }
+            main.post { if (b == batch) finishAll() }
             return
         }
         tts.setSpeechRate(rate)
-        lastId = "$b-${parts.size - 1}"
         parts.forEachIndexed { i, p ->
-            tts.speak(p, TextToSpeech.QUEUE_ADD, null, "$b-$i")
+            tts.speak(p, TextToSpeech.QUEUE_ADD, null, "$b:$i")
         }
     }
 
     fun stop() {
-        lastId = null
-        doneCallback = null
+        batch++
+        listener = null
         if (ready) tts.stop()
     }
 
@@ -67,28 +76,46 @@ class Speaker(context: Context, private val onReady: (Boolean) -> Unit) : Uttera
         tts.shutdown()
     }
 
-    private fun finish() {
-        val cb = doneCallback
-        doneCallback = null
-        lastId = null
-        cb?.invoke()
+    private fun finishAll() {
+        val l = listener
+        listener = null
+        l?.onAllDone()
     }
 
-    private fun handleEnd(id: String?) {
-        if (id == null || id != lastId) return
-        main.post { if (id == lastId) finish() }
+    private fun parse(id: String?): IntArray? {
+        if (id == null) return null
+        val k = id.indexOf(':')
+        if (k < 0) return null
+        val b = id.substring(0, k).toIntOrNull() ?: return null
+        val i = id.substring(k + 1).toIntOrNull() ?: return null
+        return intArrayOf(b, i)
     }
 
-    override fun onStart(utteranceId: String?) {}
+    private fun ended(id: String?) {
+        val p = parse(id) ?: return
+        main.post {
+            if (p[0] != batch) return@post
+            listener?.onSegmentDone(p[1])
+            if (p[0] == batch && p[1] == count - 1) finishAll()
+        }
+    }
 
-    override fun onDone(utteranceId: String?) = handleEnd(utteranceId)
+    override fun onStart(utteranceId: String?) {
+        val p = parse(utteranceId) ?: return
+        main.post { if (p[0] == batch) listener?.onSegmentStart(p[1]) }
+    }
+
+    override fun onDone(utteranceId: String?) = ended(utteranceId)
 
     @Deprecated("Deprecated in Java")
-    override fun onError(utteranceId: String?) = handleEnd(utteranceId)
+    override fun onError(utteranceId: String?) = ended(utteranceId)
 
-    override fun onError(utteranceId: String?, errorCode: Int) = handleEnd(utteranceId)
+    override fun onError(utteranceId: String?, errorCode: Int) = ended(utteranceId)
 
-    companion object {
-        private const val CHUNK = 1000
+    override fun onStop(utteranceId: String?, interrupted: Boolean) {}
+
+    override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) {
+        val p = parse(utteranceId) ?: return
+        main.post { if (p[0] == batch) listener?.onWord(p[1], start, end) }
     }
 }

@@ -18,6 +18,7 @@ class Overlay(
     private val prefs: Prefs,
     private val onPlayPause: () -> Unit,
     private val onNext: () -> Unit,
+    private val onRestart: () -> Unit,
 ) {
     private val wm: WindowManager = ctx.getSystemService(WindowManager::class.java)
     private val density = ctx.resources.displayMetrics.density
@@ -61,6 +62,7 @@ class Overlay(
         root.addView(next)
 
         playBtn.setOnClickListener { onPlayPause() }
+        playBtn.setOnLongClickListener { onRestart(); true }
         next.setOnClickListener { onNext() }
         handle.setOnTouchListener(DragListener())
     }

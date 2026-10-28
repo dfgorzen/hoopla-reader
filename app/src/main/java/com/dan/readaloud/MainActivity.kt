@@ -90,6 +90,14 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, on -> prefs.carryFragments = on }
         })
 
+        col.addView(Switch(this).apply {
+            text = "Highlight what's being read"
+            isChecked = prefs.highlight
+            setPadding(0, dp(12), 0, dp(4))
+            setOnCheckedChangeListener { _, on -> prefs.highlight = on }
+        })
+        col.addView(note("Highlights the sentence; also the word if your TTS engine reports word timing."))
+
         col.addView(label("Show the controls in these apps (blank = all apps)"))
         col.addView(EditText(this).apply {
             setText(prefs.packages)
@@ -106,8 +114,10 @@ class MainActivity : Activity() {
         col.addView(heading("How to use", 18f))
         col.addView(note(
             "Open a book in hoopla. A small ▶ control appears. Tap it to start; it reads the page, " +
-                "turns it, and keeps going. ⏭ skips a page, ⠇ drags the control. Reading stops when " +
-                "the page stops changing or you leave the app. The screen stays on while reading."
+                "turns it, and keeps going. Text already read (repeated across pages) is skipped. " +
+                "⏭ skips a page, long-press ▶ re-reads the page from the top, ⠇ drags the control. " +
+                "Pause before turning pages by hand. Reading stops after several pages with no new " +
+                "text or when you leave the app. The screen stays on while reading."
         ))
     }
 

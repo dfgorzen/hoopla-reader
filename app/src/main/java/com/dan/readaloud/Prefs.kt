@@ -34,6 +34,10 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("carry", true)
         set(v) = sp.edit().putBoolean("carry", v).apply()
 
+    var highlight: Boolean
+        get() = sp.getBoolean("highlight", true)
+        set(v) = sp.edit().putBoolean("highlight", v).apply()
+
     /** Comma-separated package names where the control shows. Blank = every app. */
     var packages: String
         get() = sp.getString("packages", DEFAULT_PACKAGES) ?: DEFAULT_PACKAGES
