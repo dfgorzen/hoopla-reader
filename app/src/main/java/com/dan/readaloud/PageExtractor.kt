@@ -170,6 +170,29 @@ object PageExtractor {
         var prevEndsSpace = false
         var ended = false
         var next: Cursor? = null
+        var lastRect: RectF? = null
+
+        /** r comes after `last` in reading order: on a lower line, or later on the same line. */
+        fun isAfter(r: RectF, last: RectF): Boolean =
+            r.top >= last.top + 0.5f * last.height() ||
+                (kotlin.math.abs(r.centerY() - last.centerY()) < 0.5f * last.height() && r.left >= last.left)
+
+        /**
+         * A page end at leaf [li] may be fake: hoopla mis-positions inline elements (italic
+         * words) far from where they're drawn. If the next text carries on normally right
+         * after what we've taken, the page hasn't really ended.
+         */
+        fun falseEnd(li: Int): Boolean {
+            val last = lastRect ?: return false
+            for (k in li + 1 until minOf(n, li + 4)) {
+                val l = leaves[k]
+                if (rightClamped(l)) return false
+                val rs = rectsFor(k) ?: continue
+                val r = rs.firstOrNull { it != null } ?: continue
+                return onScreen(r) && !occupied.hits(r.centerX(), r.centerY()) && isAfter(r, last)
+            }
+            return false
+        }
 
         // Bookmark is partway down this page (the top was already read): mark that text's
         // spots as taken so a misplaced continuation landing there is still caught.
@@ -184,6 +207,7 @@ object PageExtractor {
                     occupied.add(r)
                     lastTop = r.top
                     lastH = r.height()
+                    lastRect = r
                     seenOnPage = true
                 }
             }
@@ -234,10 +258,16 @@ object PageExtractor {
                         occupied.add(r)
                         lastTop = r.top
                         lastH = r.height()
+                        lastRect = r
                         seenOnPage = true
                         if (firstR == null) firstR = r
                         lastR = r
                     } else if (seenOnPage) {
+                        if (falseEnd(li)) {
+                            // Misplaced inline element: keep the rest of it as text, no highlight.
+                            for (k in i until t.length) keep[k] = null
+                            break
+                        }
                         cut = i   // ran off this page
                         break
                     }
