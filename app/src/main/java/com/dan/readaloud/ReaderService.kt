@@ -40,6 +40,29 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private var pageSegs: List<Seg> = emptyList()
     private var sentenceRects: List<RectF> = emptyList()
     private var wordEvents = 0
+    private var pageText = ""
+
+    // Estimated word highlight for TTS engines that don't report word timing.
+    private var curSeg = -1
+    private var segStartAt = 0L
+    private var charsPerMs = 0f
+    private var calibratedRate = 0f
+    private val wordTick = object : Runnable {
+        override fun run() {
+            if (!playing || wordEvents > 0) return
+            val s = pageSegs.getOrNull(curSeg) ?: return
+            val len = s.end - s.start
+            if (len <= 0) return
+            val elapsed = android.os.SystemClock.uptimeMillis() - segStartAt
+            val pos = (elapsed * charsPerMs).toInt().coerceIn(0, len - 1)
+            var a = s.start + pos
+            var b = a
+            while (a > s.start && !pageText[a - 1].isWhitespace()) a--
+            while (b < s.end && !pageText[b].isWhitespace()) b++
+            highlight?.set(sentenceRects, TextUtil.lineRects(pageRects, a, b))
+            h.postDelayed(this, 90)
+        }
+    }
 
     private val readRunnable = Runnable { readCurrentPage() }
 
@@ -119,6 +142,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private fun pause() {
         playing = false
         h.removeCallbacks(readRunnable)
+        h.removeCallbacks(wordTick)
         if (::speaker.isInitialized) speaker.stop()
         highlight?.clear()
         overlay?.setPlaying(false)
@@ -136,6 +160,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     private fun skipPage() {
         h.removeCallbacks(readRunnable)
+        h.removeCallbacks(wordTick)
         speaker.stop()
         highlight?.clear()
         carry = ""
@@ -221,7 +246,9 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         emptyTurns = 0
         pendingCarry = newCarry
         pageRects = ArrayList(buf.rects)
+        pageText = text
         pageSegs = toSpeak
+        curSeg = -1
         sentenceRects = emptyList()
         speaker.speak(toSpeak.map { it.text }, prefs.speechRate, this)
     }
@@ -250,10 +277,18 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     // ---- speech callbacks ----
 
     override fun onSegmentStart(index: Int) {
+        curSeg = index
+        segStartAt = android.os.SystemClock.uptimeMillis()
+        if (prefs.speechRate != calibratedRate) {
+            calibratedRate = prefs.speechRate
+            charsPerMs = 0.014f * calibratedRate   // ~14 chars/s at 1.0×, refined below
+        }
+        h.removeCallbacks(wordTick)
         if (!prefs.highlight) return
         val s = pageSegs.getOrNull(index) ?: return
         sentenceRects = TextUtil.lineRects(pageRects, s.start, s.end)
         highlight?.set(sentenceRects, emptyList())
+        if (wordEvents == 0) h.post(wordTick)
     }
 
     override fun onWord(index: Int, start: Int, end: Int) {
@@ -266,11 +301,20 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     }
 
     override fun onSegmentDone(index: Int) {
+        h.removeCallbacks(wordTick)
         val s = pageSegs.getOrNull(index) ?: return
         history.add(TextUtil.key(s.text))
+        // Calibrate the word estimate from how long this sentence really took.
+        val dur = android.os.SystemClock.uptimeMillis() - segStartAt
+        val len = s.end - s.start
+        if (index == curSeg && dur > 300 && len >= 15) {
+            val cps = len.toFloat() / dur
+            charsPerMs = if (charsPerMs <= 0f) cps else charsPerMs * 0.7f + cps * 0.3f
+        }
     }
 
     override fun onAllDone() {
+        h.removeCallbacks(wordTick)
         if (!playing) return
         highlight?.clear()
         carry = pendingCarry
@@ -366,7 +410,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
                 sb.appendLine("== extracted page ==")
                 val page = PageBuffer()
                 val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, page)
-                sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} firstTruncated=${res.firstTruncated} lastTruncated=${res.lastTruncated}")
+                sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} webView=${res.usedWebView} firstTruncated=${res.firstTruncated} lastTruncated=${res.lastTruncated}")
+                sb.appendLine("word estimate: ${charsPerMs * 1000f} chars/s")
                 val text = page.text()
                 val segs = TextUtil.segments(text)
                 val skip = TextUtil.repeats(segs.map { TextUtil.key(it.text) }, history)

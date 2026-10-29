@@ -8,10 +8,17 @@ import android.view.accessibility.AccessibilityNodeInfo
 /**
  * Pulls the text that is actually on screen out of the reading app's accessibility tree.
  *
- * Ebook readers lay a chapter out as columns, so one paragraph node can span the current
- * page and the next. Asking for per-character screen positions lets us keep only the
- * characters on this page, and gives the rectangles used for highlighting.
- * Falls back to whole nodes when the app doesn't report character positions.
+ * What hoopla (a WebView) exposes, from a diagnostic dump:
+ *  - The whole chapter is in the tree. Pages before/after the visible one are squashed
+ *    into 0–2 px strips at the left/right screen edge; their characters get zero- or
+ *    2-px-wide rectangles.
+ *  - Spaces at line wraps report the whole paragraph's box (tall, full width).
+ *  - The chapter title and page counter are native views outside the WebView.
+ *
+ * So: read only inside the WebView, ignore degenerate/oversized character boxes, and
+ * treat the visible page as one contiguous run of the document — once text has started,
+ * the first character that lands off the page (or on top of text already taken, i.e. a
+ * later page drawn at the same spot) ends the page.
  */
 object PageExtractor {
     class Result(
@@ -21,70 +28,105 @@ object PageExtractor {
         /** Last block is cut off at the page end. null = unknown. */
         val lastTruncated: Boolean?,
         val hasCharPositions: Boolean,
+        val usedWebView: Boolean,
     )
 
     private class Leaf(val node: AccessibilityNodeInfo, val text: CharSequence, val bounds: Rect)
 
     private const val KEY = AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_KEY
     private const val CHUNK = 1000
+    private const val MIN_W = 3f
     private val skipClasses = listOf("Button", "EditText", "Image", "SeekBar", "ProgressBar", "Switch", "CheckBox")
 
     fun extract(root: AccessibilityNodeInfo, window: Rect, topPct: Int, bottomPct: Int, into: PageBuffer): Result {
-        val h = window.height()
-        val band = Rect(
-            window.left,
-            window.top + h * topPct / 100,
-            window.right,
-            window.bottom - h * bottomPct / 100
-        )
-        val leaves = ArrayList<Leaf>()
-        collect(root, leaves, band, 0)
+        val web = findContentWebView(root)
+        val band: Rect
+        val start: AccessibilityNodeInfo
+        if (web != null) {
+            band = Rect()
+            web.getBoundsInScreen(band)
+            if (!band.intersect(window)) band.set(window)
+            start = web
+        } else {
+            val h = window.height()
+            band = Rect(window.left, window.top + h * topPct / 100, window.right, window.bottom - h * bottomPct / 100)
+            start = root
+        }
 
+        val leaves = ArrayList<Leaf>()
+        collect(start, leaves, band, 0)
+
+        val occupied = Occupancy()
         val startLen = into.length
         var firstTrunc: Boolean? = null
         var lastTrunc: Boolean? = null
         var prevLast: RectF? = null
-        var any = false
+        var started = false
         var anyChars = false
 
         for (leaf in leaves) {
             val t = leaf.text
-            val rs = charRects(leaf.node, t.length)
-            var from = 0
-            var to = t.length
+            val raw = charRects(leaf.node, t.length)
+            var from: Int
+            var to: Int
             var startTrunc: Boolean? = null
             var endTrunc: Boolean? = null
             var firstRect: RectF? = null
             var lastRect: RectF? = null
+            var pageEnds = false
+            var clean: Array<RectF?>? = null
 
-            if (rs != null) {
+            if (raw != null) {
+                anyChars = true
+                val cr = sanitize(raw)
+                clean = cr
                 var first = -1
                 var last = -1
-                for (i in rs.indices) {
-                    val r = rs[i] ?: continue
-                    if (r.isEmpty) continue
-                    if (band.contains(r.centerX().toInt(), r.centerY().toInt())) {
+                var hasValid = false
+                for (i in cr.indices) {
+                    val r = cr[i] ?: continue
+                    hasValid = true
+                    val onPage = band.contains(r.centerX().toInt(), r.centerY().toInt()) &&
+                        !occupied.hits(r.centerX(), r.centerY())
+                    if (onPage) {
                         if (first < 0) first = i
                         last = i
+                    } else if (first >= 0) {
+                        pageEnds = true   // text ran off this page
+                        break
                     }
                 }
-                if (first < 0) continue   // node is entirely on another page
+                if (first < 0) {
+                    // Nothing of this node is on the visible page.
+                    if (started && hasValid) break      // a later page: we're done
+                    if (started && leaf.bounds.width() < 8) break
+                    continue                             // an earlier page: keep looking
+                }
+                for (i in first..last) cr[i]?.let { occupied.add(it) }
                 from = first
                 to = last + 1
                 var lead = 0
                 while (lead < t.length && t[lead].isWhitespace()) lead++
                 var tail = t.length - 1
                 while (tail >= 0 && t[tail].isWhitespace()) tail--
-                startTrunc = first > lead
-                endTrunc = last < tail
-                firstRect = rs[first]
-                lastRect = rs[last]
-                anyChars = true
+                // Unknown-position characters (spaces) at either end belong with the run.
+                while (from > lead && cr[from - 1] == null && !t[from - 1].isLetterOrDigit()) from--
+                while (to <= tail && cr[to] == null && !t[to].isLetterOrDigit()) to++
+                startTrunc = from > lead
+                endTrunc = pageEnds || to <= tail
+                firstRect = cr[first]
+                lastRect = cr[last]
             } else {
-                if (!band.contains(leaf.bounds.centerX(), leaf.bounds.centerY())) continue
+                // No character positions: whole node if its box is really on screen.
+                if (leaf.bounds.width() < 8 || !band.contains(leaf.bounds.centerX(), leaf.bounds.centerY())) {
+                    if (started && leaf.bounds.width() < 8) break
+                    continue
+                }
+                from = 0
+                to = t.length
             }
 
-            if (any) {
+            if (started) {
                 // Same line as the previous piece = inline element (italics, link): join directly.
                 val pl = prevLast
                 val inline = pl != null && firstRect != null &&
@@ -94,12 +136,76 @@ object PageExtractor {
                 if (into.length > 0) into.space()
                 firstTrunc = startTrunc
             }
-            into.append(t, rs, from, to)
-            any = true
+            into.append(t, clean, from, to)
+            started = true
             prevLast = lastRect
             lastTrunc = endTrunc
+            if (pageEnds) break
         }
-        return Result(into.length - startLen, firstTrunc, lastTrunc, anyChars)
+        return Result(into.length - startLen, firstTrunc, lastTrunc, anyChars, web != null)
+    }
+
+    /** Largest visible WebView: the book page. Null for native readers. */
+    private fun findContentWebView(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = 0L
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 40) return
+            val cls = n.className?.toString().orEmpty()
+            if (cls.endsWith("WebView") && n.isVisibleToUser) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                val a = r.width().toLong() * r.height()
+                if (a > bestArea) {
+                    bestArea = a; best = n
+                }
+                return   // the page text is inside; no need to look deeper
+            }
+            for (i in 0 until n.childCount) {
+                val c = n.getChild(i) ?: continue
+                walk(c, depth + 1)
+            }
+        }
+        walk(root, 0)
+        return if (bestArea > 0) best else null
+    }
+
+    /**
+     * Drops boxes that can't be a real glyph on screen: empty, squashed to the screen edge
+     * (other pages), or much taller than a text line (line-wrap spaces report the paragraph box).
+     */
+    private fun sanitize(rs: Array<RectF?>): Array<RectF?> {
+        val heights = ArrayList<Float>()
+        for (r in rs) if (r != null && r.width() >= MIN_W && r.height() > 0f) heights.add(r.height())
+        val out = arrayOfNulls<RectF>(rs.size)
+        if (heights.isEmpty()) return out
+        heights.sort()
+        val maxH = heights[heights.size / 2] * 1.6f
+        for (i in rs.indices) {
+            val r = rs[i] ?: continue
+            if (r.width() < MIN_W || r.height() <= 0f || r.height() > maxH) continue
+            out[i] = r
+        }
+        return out
+    }
+
+    /** Screen spots already covered by accepted text, bucketed by row. */
+    private class Occupancy {
+        private val rows = HashMap<Int, ArrayList<RectF>>()
+
+        fun add(r: RectF) {
+            val inset = RectF(r)
+            inset.inset(r.width() * 0.2f, r.height() * 0.2f)
+            val k0 = (inset.top / 32f).toInt()
+            val k1 = (inset.bottom / 32f).toInt()
+            for (k in k0..k1) rows.getOrPut(k) { ArrayList() }.add(inset)
+        }
+
+        fun hits(x: Float, y: Float): Boolean {
+            val list = rows[(y / 32f).toInt()] ?: return false
+            for (r in list) if (r.contains(x, y)) return true
+            return false
+        }
     }
 
     /** Depth-first, document order. Keeps the deepest nodes that carry text. */
@@ -107,7 +213,8 @@ object PageExtractor {
         if (depth > 150 || !n.isVisibleToUser) return false
         val r = Rect()
         n.getBoundsInScreen(r)
-        if (!Rect.intersects(r, band)) return false
+        // Keep squashed (0–2 px wide) nodes at the screen edges: they mark earlier/later pages.
+        if (r.bottom < band.top || r.top > band.bottom || r.right < band.left || r.left > band.right) return false
         val cls = n.className?.toString().orEmpty()
         if (skipClasses.any { cls.contains(it) }) return false
 
