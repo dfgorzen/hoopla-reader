@@ -34,6 +34,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("carry", true)
         set(v) = sp.edit().putBoolean("carry", v).apply()
 
+    /** Keep reading (to the end of the chapter) when the screen turns off. */
+    var screenOffReading: Boolean
+        get() = sp.getBoolean("screenOff", true)
+        set(v) = sp.edit().putBoolean("screenOff", v).apply()
+
     var highlight: Boolean
         get() = sp.getBoolean("highlight", true)
         set(v) = sp.edit().putBoolean("highlight", v).apply()

@@ -20,6 +20,7 @@ class Overlay(
     private val onNext: () -> Unit,
     private val onRestart: () -> Unit,
     private val onDump: () -> Unit,
+    private val onPocket: () -> Unit,
 ) {
     private val wm: WindowManager = ctx.getSystemService(WindowManager::class.java)
     private val density = ctx.resources.displayMetrics.density
@@ -58,9 +59,12 @@ class Overlay(
         val handle = makeButton(GRIP).apply { alpha = 0.6f }
         playBtn = makeButton(PLAY)
         val next = makeButton(NEXT)
+        val pocket = makeButton(MOON)
         root.addView(handle)
         root.addView(playBtn)
         root.addView(next)
+        root.addView(pocket)
+        pocket.setOnClickListener { onPocket() }
 
         playBtn.setOnClickListener { onPlayPause() }
         playBtn.setOnLongClickListener { onRestart(); true }
@@ -136,5 +140,6 @@ class Overlay(
         private const val PLAY = "▶︎"
         private const val PAUSE = "⏸︎"
         private const val NEXT = "⏭︎"
+        private const val MOON = "☾"
     }
 }

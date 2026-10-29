@@ -46,6 +46,10 @@ object PageExtractor {
         val note: String,
         /** Screen spot of the first drawn character; must hold still before a new page is read. */
         val gPlace: String = "",
+        /** Bookmark position minus screen start, in characters; null if the bookmark isn't in this chapter. */
+        val cursorDelta: Int? = null,
+        /** Characters from the screen start to this page's end. */
+        val pageSpan: Int = 0,
     ) {
         fun cursorFor(src: Long): Cursor? {
             if (src < 0) return null
@@ -153,6 +157,7 @@ object PageExtractor {
         var fromCursor = false
         var note = ""
         var blindParagraph = false
+        var cursorDelta: Int? = null
         if (cursor != null && gLeaf < 0) {
             // Nothing positioned on screen: the page is the middle of one long paragraph
             // that hoopla files under an earlier page. Read on from the bookmark to the end
@@ -171,6 +176,7 @@ object PageExtractor {
             if (idx >= 0) {
                 val posC = prefix[idx] + cursor.char.coerceIn(0, texts[idx].length)
                 val posG = prefix[gLeaf] + gChar
+                cursorDelta = posC - posG
                 if (posC >= posG - BACK_WINDOW && posC <= posG + AHEAD_WINDOW) {
                     sLeaf = idx; sChar = cursor.char; fromCursor = true
                     note = "bookmark ${posC - posG} chars from screen start"
@@ -353,9 +359,11 @@ object PageExtractor {
             for (l in leaves) if (l.bounds.width() >= 8 && Rect.intersects(l.bounds, band)) areaTop = minOf(areaTop, l.bounds.top.toFloat())
             if (bufG > startLen && areaTop < Float.MAX_VALUE) synthesizeLeadIn(into, startLen, bufG, accepted, areaTop)
         }
+        val posG = if (gLeaf >= 0) prefix[gLeaf] + gChar else 0
+        val posNext = next?.let { prefix[it.leaf] + it.char } ?: prefix[n]
         return Result(
             into.length - startLen, anyChars, web != null, pending, fromCursor,
-            ended, next, pageKey, texts, note, gPlace
+            ended, next, pageKey, texts, note, gPlace, cursorDelta, posNext - posG
         )
     }
 

@@ -2,6 +2,13 @@ package com.dan.readaloud
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.PowerManager
+import android.view.KeyEvent
 import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
@@ -48,6 +55,29 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private var settlingPlace = ""
     private var settleTries = 0
 
+    // Pocket mode and screen-off reading.
+    private var pocket: PocketOverlay? = null
+    private var pocketOn = false
+    private var speaking = false
+    private var chapterTexts: List<String>? = null   // all paragraphs of the current chapter
+    private var blindMode = false    // screen is off: reading the chapter from memory
+    private var blindAtEnd = false
+    private var catchTries = 0
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var volUpDown = false
+    private var volDownDown = false
+    private val catchRunnable = Runnable { catchStep() }
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            when (i?.action) {
+                Intent.ACTION_SCREEN_OFF -> onScreenOff()
+                Intent.ACTION_USER_PRESENT -> onUnlocked()
+                Intent.ACTION_SCREEN_ON ->
+                    if (getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == false) onUnlocked()
+            }
+        }
+    }
+
     private var pageRects: List<RectF?> = emptyList()
     private var pageSegs: List<Seg> = emptyList()
     private var sentenceRects: List<RectF> = emptyList()
@@ -92,7 +122,16 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             onNext = { skipPage() },
             onRestart = { restartPage() },
             onDump = { dumpScreen() },
+            onPocket = { enterPocket() },
         )
+        pocket = PocketOverlay(this) { exitPocket() }
+        val f = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(screenReceiver, f, Context.RECEIVER_EXPORTED)
+        else registerReceiver(screenReceiver, f)
         updateOverlayFor(targetRoot()?.packageName?.toString())
     }
 
@@ -108,7 +147,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         val targets = prefs.targets()
         if (targets.isEmpty() || pkg in targets) {
             highlight?.show()
-            overlay?.show()
+            if (!pocketOn) overlay?.show()
         } else {
             if (playing) pause()
             overlay?.hide()
@@ -123,6 +162,9 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     override fun onDestroy() {
         instance = null
         h.removeCallbacksAndMessages(null)
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
+        releaseWake()
+        pocket?.hide()
         if (::speaker.isInitialized) speaker.shutdown()
         overlay?.hide()
         highlight?.hide()
@@ -154,7 +196,11 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     private fun pause() {
         playing = false
+        speaking = false
+        blindMode = false
+        releaseWake()
         h.removeCallbacks(readRunnable)
+        h.removeCallbacks(catchRunnable)
         h.removeCallbacks(wordTick)
         if (::speaker.isInitialized) speaker.stop()
         highlight?.clear()
@@ -191,6 +237,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     /** After a swipe: look early, then keep polling until the new page is ready. */
     private fun afterTurn() {
+        if (blindMode) return
         turnStartedAt = android.os.SystemClock.uptimeMillis()
         pendingCount = 0
         staleCount = 0
@@ -201,7 +248,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     }
 
     private fun readCurrentPage() {
-        if (!playing) return
+        if (!playing || blindMode) return
         val root = targetRoot()
         if (root == null) {
             retryBlank(); return
@@ -257,6 +304,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         blankTries = 0
         staleTries = 0
         lastPageKey = res.pageKey
+        chapterTexts = res.leafTexts
         // Learn how much text a full page holds (used for pages with no positioned text).
         if (res.pageEnded && !res.pageKey.startsWith("blind") && res.added in 300..6000) {
             avgPageChars = avgPageChars * 0.7f + res.added * 0.3f
@@ -301,6 +349,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         curSeg = -1
         sentenceRects = emptyList()
         readStartedSpeakAt = android.os.SystemClock.uptimeMillis()
+        speaking = true
         speaker.speak(toSpeak.map { it.text }, prefs.speechRate, this)
     }
 
@@ -372,10 +421,16 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     override fun onAllDone() {
         h.removeCallbacks(wordTick)
+        speaking = false
         if (!playing) return
         highlight?.clear()
+        if (blindMode && blindAtEnd) return   // said "end of chapter"; wait for unlock
         cursor = pendingCursor
         pendingCursor = null
+        if (blindMode) {
+            h.post { speakBlindNext() }
+            return
+        }
         turnPage { afterTurn() }
     }
 
@@ -415,9 +470,26 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             GestureDescription.StrokeDescription(path, 0, 250)
         }
         var fired = false
-        val once = { if (!fired) { fired = true; after() } }
+        val once = {
+            if (!fired) {
+                fired = true
+                pocket?.passThrough(false)
+                after()
+            }
+        }
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        if (pocketOn) {
+            // Let our own swipe through the black layer, then block touches again.
+            pocket?.passThrough(true)
+            h.postDelayed({ dispatch(gesture, once) }, 60)
+            return
+        }
+        dispatch(gesture, once)
+    }
+
+    private fun dispatch(gesture: GestureDescription, once: () -> Unit) {
         val ok = dispatchGesture(
-            GestureDescription.Builder().addStroke(stroke).build(),
+            gesture,
             object : AccessibilityService.GestureResultCallback() {
                 override fun onCompleted(gestureDescription: GestureDescription?) = once()
                 override fun onCancelled(gestureDescription: GestureDescription?) = once()
@@ -425,6 +497,198 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             null
         )
         if (!ok) once()
+    }
+
+    // ---- pocket mode ----
+
+    private fun enterPocket() {
+        if (pocketOn) return
+        pocketOn = true
+        highlight?.clear()
+        overlay?.hide()
+        pocket?.show()
+        toast("Pocket mode. To exit: hold the screen 2 s, or press both volume keys together.")
+    }
+
+    private fun exitPocket() {
+        if (!pocketOn) return
+        pocketOn = false
+        pocket?.hide()
+        overlay?.show()
+    }
+
+    /** Both volume keys down together = leave pocket mode. Volume otherwise works as normal. */
+    override fun onKeyEvent(event: KeyEvent?): Boolean {
+        if (event == null || !pocketOn) return false
+        val down = event.action == KeyEvent.ACTION_DOWN
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> volUpDown = down
+            KeyEvent.KEYCODE_VOLUME_DOWN -> volDownDown = down
+            else -> return false
+        }
+        if (volUpDown && volDownDown) {
+            volUpDown = false
+            volDownDown = false
+            h.post { exitPocket() }
+            return true
+        }
+        return false
+    }
+
+    // ---- screen off: keep reading the chapter from memory ----
+
+    private fun onScreenOff() {
+        if (!playing || !prefs.screenOffReading || chapterTexts == null || blindMode) return
+        blindMode = true
+        blindAtEnd = false
+        acquireWake()
+        h.removeCallbacks(readRunnable)
+        h.removeCallbacks(wordTick)
+        h.removeCallbacks(catchRunnable)
+        // A page still being spoken finishes first (onAllDone continues from memory);
+        // otherwise we were between pages: carry on from the bookmark now.
+        if (!speaking) speakBlindNext()
+    }
+
+    private fun onUnlocked() {
+        if (!blindMode) return
+        blindMode = false
+        blindAtEnd = false
+        releaseWake()
+        if (!playing) return
+        // Stop mid-sentence; the bookmark is the start of the part being read, and
+        // sentences already spoken are skipped when it is read again.
+        speaker.stop()
+        speaking = false
+        pendingCursor = null
+        catchTries = 0
+        h.postDelayed(catchRunnable, 700)
+    }
+
+    /** Speak about a page of the chapter after the bookmark, from the remembered text. */
+    private fun speakBlindNext() {
+        if (!playing || !blindMode) return
+        val texts = chapterTexts
+        val c = cursor
+        if (texts == null || c == null) { blindEnd(false); return }
+        val idx = if (c.leaf in texts.indices && texts[c.leaf] == c.leafText) c.leaf else texts.indexOf(c.leafText)
+        if (idx < 0) { blindEnd(false); return }
+
+        val buf = PageBuffer()
+        var started = false
+        var prevEndsSpace = false
+        var total = 0
+        var reachedEnd = true
+        for (li in idx until texts.size) {
+            val t = texts[li]
+            val from = if (li == idx) c.char.coerceIn(0, t.length) else 0
+            if (from >= t.length) continue
+            if (started) {
+                val c0 = t[from]
+                if (!(prevEndsSpace || c0.isWhitespace() || ",.;:!?’”)]".indexOf(c0) >= 0)) buf.blockBreak()
+            }
+            buf.append(t, null, from, t.length, li)
+            started = true
+            prevEndsSpace = t.last().isWhitespace()
+            total += t.length - from
+            if (total > avgPageChars * 3) { reachedEnd = li == texts.size - 1; break }
+        }
+        val text = buf.text()
+        val segs = TextUtil.segments(text)
+        if (segs.isEmpty()) { blindEnd(true); return }
+
+        val batch = ArrayList<Seg>()
+        var len = 0
+        for (s in segs) {
+            batch.add(s); len += s.text.length
+            if (len >= avgPageChars) break
+        }
+        val nextSeg = segs.getOrNull(batch.size)
+        pendingCursor = when {
+            nextSeg != null -> cursorAt(buf, nextSeg.start, texts)
+            reachedEnd -> PageExtractor.Cursor(texts.size - 1, texts.last().length, texts.last())
+            else -> cursorAt(buf, buf.length - 1, texts)
+        }
+
+        val skip = TextUtil.repeats(batch.map { TextUtil.key(it.text) }, history)
+        val toSpeak = batch.filterIndexed { i, _ -> !skip[i] }
+        if (toSpeak.isEmpty()) {
+            cursor = pendingCursor
+            if (nextSeg == null && reachedEnd) blindEnd(true) else h.post { speakBlindNext() }
+            return
+        }
+        pageRects = emptyList()   // nothing to highlight with the screen off
+        pageText = text
+        pageSegs = toSpeak
+        curSeg = -1
+        speaking = true
+        speaker.speak(toSpeak.map { it.text }, prefs.speechRate, this)
+    }
+
+    private fun cursorAt(buf: PageBuffer, index: Int, texts: List<String>): PageExtractor.Cursor? {
+        var i = index.coerceIn(0, buf.length - 1)
+        while (i < buf.length && buf.src[i] < 0) i++
+        if (i >= buf.length) return null
+        val s = buf.src[i]
+        val li = (s ushr 32).toInt()
+        val ci = (s and 0xffffffffL).toInt()
+        return if (li in texts.indices) PageExtractor.Cursor(li, ci, texts[li]) else null
+    }
+
+    /** End of what we can read with the screen off: say so once, then wait for unlock. */
+    private fun blindEnd(chapterEnd: Boolean) {
+        blindAtEnd = true
+        pageSegs = emptyList()
+        val msg = if (chapterEnd) "End of chapter. Unlock your phone to keep reading."
+        else "Unlock your phone to keep reading."
+        speaking = true
+        speaker.speak(listOf(msg), prefs.speechRate, this)
+    }
+
+    /** After unlocking: swipe hoopla forward until the bookmark is on screen, then read normally. */
+    private fun catchStep() {
+        if (!playing) return
+        val root = targetRoot()
+        val pkg = root?.packageName?.toString()
+        val targets = prefs.targets()
+        if (root == null || pkg == "com.android.systemui" || (targets.isNotEmpty() && pkg !in targets)) {
+            if (++catchTries < 30) h.postDelayed(catchRunnable, 500) else pause()
+            return
+        }
+        val win = Rect()
+        root.getBoundsInScreen(win)
+        val res = PageExtractor.extract(
+            root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, PageBuffer(), avgPageChars.toInt()
+        )
+        if (res.pending && catchTries++ < 40) {
+            h.postDelayed(catchRunnable, POLL_MS.toLong()); return
+        }
+        val d = res.cursorDelta
+        if (d != null && d > res.pageSpan && res.pageSpan > 0 && catchTries++ < 200) {
+            // Our place is further on: flip forward.
+            turnPage { h.postDelayed(catchRunnable, 650) }
+            return
+        }
+        // On this page (or the bookmark is gone, e.g. a new chapter): carry on normally.
+        lastPageKey = ""
+        awaitingFirstWord = false
+        staleTries = 0
+        emptyTurns = 0
+        readCurrentPage()
+    }
+
+    private fun acquireWake() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ReadAloud:screenoff").apply {
+            setReferenceCounted(false)
+            acquire(4 * 60 * 60 * 1000L)
+        }
+    }
+
+    private fun releaseWake() {
+        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+        wakeLock = null
     }
 
     // ---- diagnostics (long-press ⏭) ----

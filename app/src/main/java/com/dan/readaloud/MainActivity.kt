@@ -99,6 +99,14 @@ class MainActivity : Activity() {
         })
         col.addView(note("Highlights the sentence; also the word if your TTS engine reports word timing."))
 
+        col.addView(Switch(this).apply {
+            text = "Keep reading with the screen off"
+            isChecked = prefs.screenOffReading
+            setPadding(0, dp(12), 0, dp(4))
+            setOnCheckedChangeListener { _, on -> prefs.screenOffReading = on }
+        })
+        col.addView(note("Reads on from memory to the end of the chapter. When you unlock, it flips hoopla forward to catch up. For longer listening use pocket mode (☾): a black screen that keeps turning pages."))
+
         col.addView(label("Show the controls in these apps (blank = all apps)"))
         col.addView(EditText(this).apply {
             setText(prefs.packages)
