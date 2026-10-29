@@ -507,7 +507,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         highlight?.clear()
         overlay?.hide()
         pocket?.show()
-        toast("Pocket mode. To exit: hold the screen 2 s, or press both volume keys together.")
+        toast("Pocket mode: tap the screen to bring up the exit button.")
     }
 
     private fun exitPocket() {
@@ -538,6 +538,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     // ---- screen off: keep reading the chapter from memory ----
 
     private fun onScreenOff() {
+        // The power button ends pocket mode, so the screen looks normal again after unlocking.
+        if (pocketOn) exitPocket()
         if (!playing || !prefs.screenOffReading || chapterTexts == null || blindMode) return
         blindMode = true
         blindAtEnd = false
