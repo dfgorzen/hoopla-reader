@@ -124,7 +124,7 @@ object PageExtractor {
         return true
     }
 
-    private fun charRects(n: AccessibilityNodeInfo, len: Int): Array<RectF?>? {
+    fun charRects(n: AccessibilityNodeInfo, len: Int): Array<RectF?>? {
         if (len == 0) return null
         val out = arrayOfNulls<RectF>(len)
         var any = false

@@ -39,6 +39,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private var pageRects: List<RectF?> = emptyList()
     private var pageSegs: List<Seg> = emptyList()
     private var sentenceRects: List<RectF> = emptyList()
+    private var wordEvents = 0
 
     private val readRunnable = Runnable { readCurrentPage() }
 
@@ -55,6 +56,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             onPlayPause = { toggle() },
             onNext = { skipPage() },
             onRestart = { restartPage() },
+            onDump = { dumpScreen() },
         )
         updateOverlayFor(targetRoot()?.packageName?.toString())
     }
@@ -255,6 +257,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     }
 
     override fun onWord(index: Int, start: Int, end: Int) {
+        wordEvents++
         if (!prefs.highlight) return
         val s = pageSegs.getOrNull(index) ?: return
         val a = (s.start + start).coerceIn(s.start, s.end)
@@ -321,6 +324,100 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             null
         )
         if (!ok) once()
+    }
+
+    // ---- diagnostics (long-press ⏭) ----
+
+    private fun dumpScreen() {
+        if (playing) pause()
+        toast("Capturing screen info…")
+        h.postDelayed({ writeDump() }, 300)
+    }
+
+    private fun writeDump() {
+        val sb = StringBuilder()
+        try {
+            val ver = try {
+                packageManager.getPackageInfo(packageName, 0).versionName
+            } catch (_: Exception) { "?" }
+            sb.appendLine("Read Aloud $ver diagnostic dump")
+            sb.appendLine("device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} SDK ${android.os.Build.VERSION.SDK_INT}")
+            sb.appendLine("settings: rate=${prefs.speechRate} turnMode=${prefs.turnMode} delay=${prefs.turnDelayMs} top=${prefs.topMarginPct}% bottom=${prefs.bottomMarginPct}% carry=${prefs.carryFragments} highlight=${prefs.highlight}")
+            sb.appendLine("word timing events from TTS so far: $wordEvents")
+            sb.appendLine()
+            sb.appendLine("== windows ==")
+            try {
+                for (w in windows) {
+                    val b = Rect(); w.getBoundsInScreen(b)
+                    sb.appendLine("type=${w.type} layer=${w.layer} active=${w.isActive} ${b.toShortString()} pkg=${w.root?.packageName}")
+                }
+            } catch (e: Exception) { sb.appendLine("windows error: $e") }
+
+            val root = targetRoot()
+            if (root == null) {
+                sb.appendLine("no target root")
+            } else {
+                val win = Rect(); root.getBoundsInScreen(win)
+                val hgt = win.height()
+                val band = Rect(win.left, win.top + hgt * prefs.topMarginPct / 100, win.right, win.bottom - hgt * prefs.bottomMarginPct / 100)
+                sb.appendLine()
+                sb.appendLine("target pkg=${root.packageName} window=${win.toShortString()} band=${band.toShortString()}")
+                sb.appendLine()
+                sb.appendLine("== extracted page ==")
+                val page = PageBuffer()
+                val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, page)
+                sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} firstTruncated=${res.firstTruncated} lastTruncated=${res.lastTruncated}")
+                val text = page.text()
+                val segs = TextUtil.segments(text)
+                val skip = TextUtil.repeats(segs.map { TextUtil.key(it.text) }, history)
+                segs.forEachIndexed { i, s ->
+                    val lines = TextUtil.lineRects(page.rects, s.start, s.end)
+                    sb.append(if (skip[i]) "SKIP " else "     ")
+                    sb.append("lines=").append(lines.size).append(' ')
+                    sb.append(lines.firstOrNull()?.toShortString() ?: "-").append(' ')
+                    sb.appendLine(Diagnostics.snip(s.text))
+                }
+                sb.appendLine()
+                sb.appendLine("== accessibility tree ==")
+                Diagnostics.tree(root, band, sb)
+            }
+        } catch (e: Exception) {
+            sb.appendLine("dump error: $e")
+        }
+        saveAndShare(sb.toString())
+    }
+
+    private fun saveAndShare(text: String) {
+        val name = "readaloud-dump-${System.currentTimeMillis() / 1000}.txt"
+        val uri = try {
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOWNLOADS)
+            }
+            val u = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            if (u != null) contentResolver.openOutputStream(u)?.use { it.write(text.toByteArray()) }
+            u
+        } catch (_: Exception) {
+            null
+        }
+        if (uri == null) {
+            toast("Couldn't save the dump")
+            return
+        }
+        toast("Saved Downloads/$name")
+        try {
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = android.content.Intent.createChooser(send, "Share dump").apply {
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(chooser)
+        } catch (_: Exception) {
+        }
     }
 
     private fun toast(msg: String) {
