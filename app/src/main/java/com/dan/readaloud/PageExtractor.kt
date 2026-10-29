@@ -31,6 +31,10 @@ object PageExtractor {
         val usedWebView: Boolean,
         /** Rest of the paragraph that was cut at the page end (continues on the next page). */
         val remainder: String,
+        /** The cut fell inside a word: join the remainder without a space. */
+        val remainderMidWord: Boolean,
+        /** Some paragraphs' character positions weren't loaded yet; reading again shortly will be more accurate. */
+        val pending: Boolean,
     )
 
     private class Leaf(val node: AccessibilityNodeInfo, val text: CharSequence, val bounds: Rect)
@@ -66,6 +70,8 @@ object PageExtractor {
         var started = false
         var anyChars = false
         var remainder = ""
+        var remainderMidWord = false
+        var pending = false
         // Top/height of the last character taken. Text only flows downward within a page,
         // so a character above this line belongs to another page (hoopla mis-positions the
         // continuation of a split paragraph on top of the current page).
@@ -74,7 +80,12 @@ object PageExtractor {
 
         for (leaf in leaves) {
             val t = leaf.text
-            val raw = charRects(leaf.node, t.length)
+            var raw = charRects(leaf.node, t.length)
+            if (raw != null && leaf.bounds.width() >= 8 && notLoaded(raw)) {
+                // WebView hasn't computed glyph positions for this paragraph yet.
+                pending = true
+                raw = null
+            }
             var from: Int
             var to: Int
             var startTrunc: Boolean? = null
@@ -134,6 +145,9 @@ object PageExtractor {
                     if (started && leaf.bounds.width() < 8) break
                     continue
                 }
+                if (!lastTop.isNaN() && leaf.bounds.top < lastTop - 0.25f * lastH) break
+                lastTop = leaf.bounds.top.toFloat()
+                lastH = 0f
                 from = 0
                 to = t.length
             }
@@ -152,10 +166,19 @@ object PageExtractor {
             started = true
             prevLast = lastRect
             lastTrunc = endTrunc
-            remainder = if (endTrunc == true && to < t.length) t.subSequence(to, t.length).toString().trim() else ""
+            if (endTrunc == true && to < t.length) {
+                remainder = t.subSequence(to, t.length).toString().trim()
+                remainderMidWord = to > 0 && t[to - 1].isLetterOrDigit() && t[to].isLetterOrDigit()
+            } else {
+                remainder = ""
+                remainderMidWord = false
+            }
             if (pageEnds) break
         }
-        return Result(into.length - startLen, firstTrunc, lastTrunc, anyChars, web != null, remainder)
+        return Result(
+            into.length - startLen, firstTrunc, lastTrunc, anyChars, web != null,
+            remainder, remainderMidWord, pending
+        )
     }
 
     /** Largest visible WebView: the book page. Null for native readers. */
@@ -200,6 +223,25 @@ object PageExtractor {
             out[i] = r
         }
         return out
+    }
+
+    /**
+     * Before its glyphs are laid out, WebView reports the paragraph's own box for every
+     * character. Real glyph boxes are nearly all distinct, so many identical ones = not loaded.
+     * (Squashed boxes of other pages are ignored here: they're narrower than MIN_W.)
+     */
+    private fun notLoaded(rs: Array<RectF?>): Boolean {
+        val counts = HashMap<RectF, Int>()
+        var n = 0
+        var maxc = 0
+        for (r in rs) {
+            if (r == null || r.width() < MIN_W) continue
+            n++
+            val c = (counts[r] ?: 0) + 1
+            counts[r] = c
+            if (c > maxc) maxc = c
+        }
+        return n >= 8 && maxc >= maxOf(4, n / 4)
     }
 
     /** Screen spots already covered by accepted text, bucketed by row. */

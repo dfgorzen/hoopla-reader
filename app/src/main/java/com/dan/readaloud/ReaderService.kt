@@ -35,6 +35,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private var staleTries = 0
     private var emptyTurns = 0
     private var blankTries = 0
+    private var posRetries = 0
 
     private var pageRects: List<RectF?> = emptyList()
     private var pageSegs: List<Seg> = emptyList()
@@ -136,6 +137,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         staleTries = 0
         emptyTurns = 0
         blankTries = 0
+        posRetries = 0
         readCurrentPage()
     }
 
@@ -191,6 +193,13 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             retryBlank(); return
         }
         blankTries = 0
+        // Glyph positions still loading after the page turn: check again shortly.
+        if (res.pending && posRetries < 4) {
+            posRetries++
+            scheduleRead(350)
+            return
+        }
+        posRetries = 0
         val raw = page.text()
 
         // Same text as the page we just read: the reader hasn't redrawn yet.
@@ -232,7 +241,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         // The rest of a paragraph cut at the page end: hoopla doesn't place it on the next
         // page, so carry its text over and read it first there.
         if (remainder.isNotEmpty()) {
-            newCarry = if (newCarry.isEmpty()) remainder else "$newCarry $remainder"
+            val sep = if (res.remainderMidWord) "" else " "
+            newCarry = if (newCarry.isEmpty()) remainder else "$newCarry$sep$remainder"
         }
         if (newCarry.length > MAX_REMAINDER) {
             val cut = newCarry.lastIndexOf(' ', MAX_REMAINDER)
@@ -424,6 +434,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
                 val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, page)
                 sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} webView=${res.usedWebView} firstTruncated=${res.firstTruncated} lastTruncated=${res.lastTruncated}")
                 sb.appendLine("word estimate: ${charsPerMs * 1000f} chars/s")
+                sb.appendLine("positions pending: ${res.pending}")
                 sb.appendLine("carried in: \"${Diagnostics.snip(carry)}\"")
                 sb.appendLine("remainder out: \"${Diagnostics.snip(res.remainder)}\"")
                 val text = page.text()
