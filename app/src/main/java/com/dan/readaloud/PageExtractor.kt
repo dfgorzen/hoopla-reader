@@ -44,6 +44,8 @@ object PageExtractor {
         val pageKey: String,
         val leafTexts: List<String>,
         val note: String,
+        /** Screen spot of the first drawn character; must hold still before a new page is read. */
+        val gPlace: String = "",
     ) {
         fun cursorFor(src: Long): Cursor? {
             if (src < 0) return null
@@ -127,6 +129,8 @@ object PageExtractor {
             }
         }
         var pageKey = if (gLeaf >= 0) "$gLeaf:$gChar:${texts[gLeaf].hashCode()}" else ""
+        // Where that first character is drawn: changes while a page-turn animation is running.
+        val gPlace = if (gLeaf >= 0) (cache[gLeaf]?.getOrNull(gChar)?.toShortString() ?: leaves[gLeaf].bounds.toShortString()) else ""
 
         // 2. Use the bookmark if it is close to that.
         val prefix = IntArray(n + 1)
@@ -176,6 +180,7 @@ object PageExtractor {
         var ended = false
         var next: Cursor? = null
         var lastRect: RectF? = null
+        val accepted = ArrayList<RectF>()
 
         /** r comes after `last` in reading order: on a lower line, or later on the same line. */
         fun isAfter(r: RectF, last: RectF): Boolean =
@@ -260,6 +265,7 @@ object PageExtractor {
                     val on = onScreen(r) && !occupied.hits(r.centerX(), r.centerY())
                     if (on) {
                         keep[i] = r
+                        accepted.add(r)
                         occupied.add(r)
                         lastTop = r.top
                         lastH = r.height()
@@ -312,9 +318,17 @@ object PageExtractor {
             into.src.subList(startLen, into.src.size).clear()
             return Result(0, anyChars, web != null, pending, true, false, cursor, pageKey, texts, "$note; nothing on screen after bookmark")
         }
+        if (fromCursor && !blindParagraph) {
+            var bufG = -1
+            for (k in startLen until into.length) if (into.rects[k] != null) { bufG = k; break }
+            // Top of the text area: highest on-screen paragraph box (boxes are right even when glyphs aren't).
+            var areaTop = Float.MAX_VALUE
+            for (l in leaves) if (l.bounds.width() >= 8 && Rect.intersects(l.bounds, band)) areaTop = minOf(areaTop, l.bounds.top.toFloat())
+            if (bufG > startLen && areaTop < Float.MAX_VALUE) synthesizeLeadIn(into, startLen, bufG, accepted, areaTop)
+        }
         return Result(
             into.length - startLen, anyChars, web != null, pending, fromCursor,
-            ended, next, pageKey, texts, note
+            ended, next, pageKey, texts, note, gPlace
         )
     }
 
@@ -357,9 +371,44 @@ object PageExtractor {
         for (i in rs.indices) {
             val r = rs[i] ?: continue
             if (r.width() < MIN_W || r.height() <= 0f || r.height() > maxH) continue
+            if (r.width() > 3f * r.height()) continue   // no glyph is that wide: a line-wrap box
             out[i] = r
         }
         return out
+    }
+
+    /**
+     * Text read from the bookmark before the first positioned character (the end of a
+     * paragraph hoopla files under the previous page) has no boxes, but it is drawn just
+     * above that character. Lay it out backwards from there using this page's own line
+     * spacing and character width, so it can still be highlighted (approximately).
+     */
+    private fun synthesizeLeadIn(buf: PageBuffer, from: Int, g: Int, acc: List<RectF>, areaTop: Float) {
+        if (acc.size < 20 || g <= from) return
+        val cw = acc.map { it.width() }.sorted()[acc.size / 2]
+        val lh = acc.map { it.height() }.sorted()[acc.size / 2]
+        val left = acc.minOf { it.left }
+        val right = acc.maxOf { it.right }
+        val lineTops = ArrayList<Float>()
+        for (t in acc.map { it.top }.sorted()) if (lineTops.isEmpty() || t - lineTops.last() > lh * 0.5f) lineTops.add(t)
+        val gaps = (1 until lineTops.size).map { lineTops[it] - lineTops[it - 1] }.filter { it < lh * 2.5f }.sorted()
+        val pitch = if (gaps.isEmpty()) lh else gaps[gaps.size / 2]
+        val gr = buf.rects[g] ?: return
+        var x = gr.left
+        var y = gr.top
+        // First positioned text starts a line (paragraph start/indent): lead-in ends on the line above.
+        if (gr.left - left < cw * 3f) { y -= pitch; x = right }
+        for (k in g - 1 downTo from) {
+            val c = buf.sb[k]
+            if (c == '\n') {
+                if (x < right - cw) { y -= pitch; x = right }
+                continue
+            }
+            if (x - cw < left - 1f) { y -= pitch; x = right }
+            x -= cw
+            if (y < areaTop - lh * 0.5f) break
+            if (buf.rects[k] == null) buf.rects[k] = RectF(x, y, x + cw, y + lh)
+        }
     }
 
     /**

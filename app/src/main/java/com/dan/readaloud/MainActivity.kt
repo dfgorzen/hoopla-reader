@@ -64,8 +64,9 @@ class MainActivity : Activity() {
         col.addView(heading("Reading", 18f))
         col.addView(slider("Speech rate", 50, 300, (prefs.speechRate * 100).roundToInt(),
             { String.format("%.2f×", it / 100f) }) { prefs.speechRate = it / 100f })
-        col.addView(slider("Wait after page turn", 300, 3000, prefs.turnDelayMs,
+        col.addView(slider("Page-turn patience", 300, 3000, prefs.turnDelayMs,
             { "$it ms" }) { prefs.turnDelayMs = it })
+        col.addView(note("Reading starts as soon as the new page is ready. This sets how long to wait for it before swiping again; raise it if pages get skipped."))
 
         col.addView(label("Page turn"))
         val rg = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }

@@ -38,6 +38,16 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private var posRetries = 0
     private var avgPageChars = 1500f
 
+    // Page-turn timing, for the diagnostic dump.
+    private var turnStartedAt = 0L
+    private var readStartedSpeakAt = 0L
+    private var pendingCount = 0
+    private var staleCount = 0
+    private var awaitingFirstWord = false
+    private var lastTurnReport = "no page turn yet"
+    private var settlingPlace = ""
+    private var settleTries = 0
+
     private var pageRects: List<RectF?> = emptyList()
     private var pageSegs: List<Seg> = emptyList()
     private var sentenceRects: List<RectF> = emptyList()
@@ -169,7 +179,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         cursor = null
         pendingCursor = null
         staleTries = 0
-        turnPage { if (playing) scheduleRead(prefs.turnDelayMs.toLong()) }
+        turnPage { if (playing) afterTurn() }
     }
 
     // ---- read loop ----
@@ -177,6 +187,17 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private fun scheduleRead(delay: Long) {
         h.removeCallbacks(readRunnable)
         h.postDelayed(readRunnable, delay)
+    }
+
+    /** After a swipe: look early, then keep polling until the new page is ready. */
+    private fun afterTurn() {
+        turnStartedAt = android.os.SystemClock.uptimeMillis()
+        pendingCount = 0
+        staleCount = 0
+        settlingPlace = ""
+        settleTries = 0
+        awaitingFirstWord = true
+        scheduleRead(FIRST_LOOK_MS)
     }
 
     private fun readCurrentPage() {
@@ -193,9 +214,10 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, page, avgPageChars.toInt()
         )
         // Glyph positions still loading after the page turn: check again shortly.
-        if (res.pending && posRetries < 6) {
+        if (res.pending && posRetries < 8) {
             posRetries++
-            scheduleRead(350)
+            pendingCount++
+            scheduleRead(POLL_MS.toLong())
             return
         }
         posRetries = 0
@@ -206,8 +228,10 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             (res.added == 0 && res.fromCursor)
         if (stale) {
             staleTries++
-            if (staleTries <= 2) {
-                scheduleRead(600)
+            staleCount++
+            // Keep checking every POLL_MS; re-swipe once the page-turn wait setting has passed.
+            if (staleTries * POLL_MS < maxOf(prefs.turnDelayMs * 2, 1200)) {
+                scheduleRead(POLL_MS.toLong())
             } else {
                 staleTries = 0
                 turnAgain()
@@ -217,6 +241,19 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         if (res.added == 0) {
             retryBlank(); return
         }
+        // Just after a swipe the page may still be sliding: only read once the first
+        // line sits in the same place on two looks in a row.
+        if (awaitingFirstWord && res.gPlace.isNotEmpty()) {
+            val place = res.pageKey + "@" + res.gPlace
+            if (place != settlingPlace && settleTries < 6) {
+                settlingPlace = place
+                settleTries++
+                scheduleRead(SETTLE_MS)
+                return
+            }
+        }
+        settlingPlace = ""
+        settleTries = 0
         blankTries = 0
         staleTries = 0
         lastPageKey = res.pageKey
@@ -249,7 +286,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             if (next != null && next != cursor) {
                 cursor = next
                 emptyTurns = 0
-                turnPage { scheduleRead(prefs.turnDelayMs.toLong()) }
+                turnPage { afterTurn() }
             } else {
                 turnAgain()
             }
@@ -263,6 +300,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         pageSegs = toSpeak
         curSeg = -1
         sentenceRects = emptyList()
+        readStartedSpeakAt = android.os.SystemClock.uptimeMillis()
         speaker.speak(toSpeak.map { it.text }, prefs.speechRate, this)
     }
 
@@ -274,7 +312,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             toast("Stopped: no new text after several page turns (end of book?)")
             return
         }
-        turnPage { scheduleRead(prefs.turnDelayMs.toLong()) }
+        turnPage { afterTurn() }
     }
 
     private fun retryBlank() {
@@ -297,6 +335,12 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             charsPerMs = 0.014f * calibratedRate   // ~14 chars/s at 1.0×, refined below
         }
         h.removeCallbacks(wordTick)
+        if (awaitingFirstWord) {
+            awaitingFirstWord = false
+            lastTurnReport = "speech resumed ${segStartAt - turnStartedAt} ms after the swipe finished " +
+                "(position-loading retries $pendingCount, page-not-turned retries $staleCount, " +
+                "page read in ${readStartedSpeakAt - turnStartedAt} ms, TTS start ${segStartAt - readStartedSpeakAt} ms)"
+        }
         if (!prefs.highlight) return
         val s = pageSegs.getOrNull(index) ?: return
         sentenceRects = TextUtil.lineRects(pageRects, s.start, s.end)
@@ -332,7 +376,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         highlight?.clear()
         cursor = pendingCursor
         pendingCursor = null
-        turnPage { scheduleRead(prefs.turnDelayMs.toLong()) }
+        turnPage { afterTurn() }
     }
 
     // ---- helpers ----
@@ -424,6 +468,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
                 val page = PageBuffer()
                 val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, page, avgPageChars.toInt())
                 sb.appendLine("learned page size: ${avgPageChars.toInt()} chars")
+                sb.appendLine("last page turn: $lastTurnReport")
                 sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} webView=${res.usedWebView} pageEnded=${res.pageEnded}")
                 sb.appendLine("word estimate: ${charsPerMs * 1000f} chars/s")
                 sb.appendLine("positions pending: ${res.pending}")
@@ -492,6 +537,9 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     companion object {
         private const val MAX_CARRY = 400
+        private const val FIRST_LOOK_MS = 250L
+        private const val POLL_MS = 200
+        private const val SETTLE_MS = 200L
 
         @Volatile
         var instance: ReaderService? = null
