@@ -94,7 +94,12 @@ object PageExtractor {
             queried[i] = true
             val l = leaves[i]
             if (l.bounds.width() < 8) return null           // squashed: another page
-            val raw = charRects(l.node, l.text.length) ?: return null
+            val raw = charRects(l.node, l.text.length)
+            if (raw == null) {
+                // A node that offers character positions but returned none: still loading.
+                if (l.node.availableExtraData.contains(KEY) && Rect.intersects(l.bounds, band)) pending = true
+                return null
+            }
             anyChars = true
             if (notLoaded(raw)) {
                 pending = true

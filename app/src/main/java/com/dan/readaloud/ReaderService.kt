@@ -193,7 +193,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, page, avgPageChars.toInt()
         )
         // Glyph positions still loading after the page turn: check again shortly.
-        if (res.pending && posRetries < 4) {
+        if (res.pending && posRetries < 6) {
             posRetries++
             scheduleRead(350)
             return
