@@ -29,6 +29,8 @@ object PageExtractor {
         val lastTruncated: Boolean?,
         val hasCharPositions: Boolean,
         val usedWebView: Boolean,
+        /** Rest of the paragraph that was cut at the page end (continues on the next page). */
+        val remainder: String,
     )
 
     private class Leaf(val node: AccessibilityNodeInfo, val text: CharSequence, val bounds: Rect)
@@ -63,6 +65,12 @@ object PageExtractor {
         var prevLast: RectF? = null
         var started = false
         var anyChars = false
+        var remainder = ""
+        // Top/height of the last character taken. Text only flows downward within a page,
+        // so a character above this line belongs to another page (hoopla mis-positions the
+        // continuation of a split paragraph on top of the current page).
+        var lastTop = Float.NaN
+        var lastH = 0f
 
         for (leaf in leaves) {
             val t = leaf.text
@@ -86,11 +94,16 @@ object PageExtractor {
                 for (i in cr.indices) {
                     val r = cr[i] ?: continue
                     hasValid = true
-                    val onPage = band.contains(r.centerX().toInt(), r.centerY().toInt()) &&
+                    val jumpedUp = !lastTop.isNaN() && r.centerY() < lastTop - 0.25f * lastH
+                    val onPage = !jumpedUp &&
+                        band.contains(r.centerX().toInt(), r.centerY().toInt()) &&
                         !occupied.hits(r.centerX(), r.centerY())
                     if (onPage) {
                         if (first < 0) first = i
                         last = i
+                        occupied.add(r)
+                        lastTop = r.top
+                        lastH = r.height()
                     } else if (first >= 0) {
                         pageEnds = true   // text ran off this page
                         break
@@ -102,7 +115,6 @@ object PageExtractor {
                     if (started && leaf.bounds.width() < 8) break
                     continue                             // an earlier page: keep looking
                 }
-                for (i in first..last) cr[i]?.let { occupied.add(it) }
                 from = first
                 to = last + 1
                 var lead = 0
@@ -140,9 +152,10 @@ object PageExtractor {
             started = true
             prevLast = lastRect
             lastTrunc = endTrunc
+            remainder = if (endTrunc == true && to < t.length) t.subSequence(to, t.length).toString().trim() else ""
             if (pageEnds) break
         }
-        return Result(into.length - startLen, firstTrunc, lastTrunc, anyChars, web != null)
+        return Result(into.length - startLen, firstTrunc, lastTrunc, anyChars, web != null, remainder)
     }
 
     /** Largest visible WebView: the book page. Null for native readers. */

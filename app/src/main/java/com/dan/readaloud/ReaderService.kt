@@ -218,13 +218,25 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
         var segs = TextUtil.segments(text)
         var newCarry = ""
+        val remainder = res.remainder
         if (prefs.carryFragments && segs.isNotEmpty()) {
             val last = segs.last()
             val incomplete = !TextUtil.endsSentence(text, last.end)
-            if (incomplete && (res.lastTruncated ?: true) && last.text.length <= MAX_CARRY) {
+            if (incomplete && (res.lastTruncated ?: true) &&
+                (last.text.length <= MAX_CARRY || remainder.isNotEmpty())
+            ) {
                 newCarry = last.text
                 segs = segs.dropLast(1)
             }
+        }
+        // The rest of a paragraph cut at the page end: hoopla doesn't place it on the next
+        // page, so carry its text over and read it first there.
+        if (remainder.isNotEmpty()) {
+            newCarry = if (newCarry.isEmpty()) remainder else "$newCarry $remainder"
+        }
+        if (newCarry.length > MAX_REMAINDER) {
+            val cut = newCarry.lastIndexOf(' ', MAX_REMAINDER)
+            newCarry = newCarry.substring(0, if (cut > 0) cut else MAX_REMAINDER)
         }
 
         // Look ahead: drop sentences already spoken (text repeated across pages).
@@ -412,6 +424,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
                 val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, page)
                 sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} webView=${res.usedWebView} firstTruncated=${res.firstTruncated} lastTruncated=${res.lastTruncated}")
                 sb.appendLine("word estimate: ${charsPerMs * 1000f} chars/s")
+                sb.appendLine("carried in: \"${Diagnostics.snip(carry)}\"")
+                sb.appendLine("remainder out: \"${Diagnostics.snip(res.remainder)}\"")
                 val text = page.text()
                 val segs = TextUtil.segments(text)
                 val skip = TextUtil.repeats(segs.map { TextUtil.key(it.text) }, history)
@@ -471,6 +485,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     companion object {
         private const val MAX_CARRY = 400
+        private const val MAX_REMAINDER = 4000
 
         @Volatile
         var instance: ReaderService? = null

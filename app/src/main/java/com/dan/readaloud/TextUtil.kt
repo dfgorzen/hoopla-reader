@@ -181,7 +181,13 @@ object TextUtil {
      */
     fun repeats(keys: List<String>, h: History): BooleanArray {
         val n = keys.size
-        val seen = BooleanArray(n) { keys[it].length >= 2 && keys[it] in h }
+        val earlier = HashSet<String>()
+        val seen = BooleanArray(n)
+        for (i in 0 until n) {
+            val k = keys[i]
+            seen[i] = k.length >= 2 && (k in h || k in earlier)   // spoken before, or repeated on this page
+            earlier.add(k)
+        }
         val skip = BooleanArray(n) { seen[it] && keys[it].length >= 24 }
         var changed = true
         while (changed) {
