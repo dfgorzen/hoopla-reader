@@ -29,13 +29,14 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private val history = History()
 
     private var playing = false
-    private var carry = ""         // unfinished sentence carried into the next page
-    private var pendingCarry = ""  // carry produced by the page being spoken
-    private var lastRaw = ""       // text of the last page we accepted
+    private var cursor: PageExtractor.Cursor? = null         // where the current page starts
+    private var pendingCursor: PageExtractor.Cursor? = null  // where the next page starts
+    private var lastPageKey = ""   // screen identity of the last page we accepted
     private var staleTries = 0
     private var emptyTurns = 0
     private var blankTries = 0
     private var posRetries = 0
+    private var avgPageChars = 1500f
 
     private var pageRects: List<RectF?> = emptyList()
     private var pageSegs: List<Seg> = emptyList()
@@ -133,7 +134,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         }
         playing = true
         overlay?.setPlaying(true)
-        lastRaw = ""
+        lastPageKey = ""
         staleTries = 0
         emptyTurns = 0
         blankTries = 0
@@ -154,8 +155,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private fun restartPage() {
         pause()
         history.clear()
-        carry = ""
-        pendingCarry = ""
+        cursor = null
+        pendingCursor = null
         toast("Reading this page from the top")
         play()
     }
@@ -165,8 +166,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         h.removeCallbacks(wordTick)
         speaker.stop()
         highlight?.clear()
-        carry = ""
-        pendingCarry = ""
+        cursor = null
+        pendingCursor = null
         staleTries = 0
         turnPage { if (playing) scheduleRead(prefs.turnDelayMs.toLong()) }
     }
@@ -188,11 +189,9 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         root.getBoundsInScreen(win)
 
         val page = PageBuffer()
-        val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, page)
-        if (res.added == 0) {
-            retryBlank(); return
-        }
-        blankTries = 0
+        val res = PageExtractor.extract(
+            root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, page, avgPageChars.toInt()
+        )
         // Glyph positions still loading after the page turn: check again shortly.
         if (res.pending && posRetries < 4) {
             posRetries++
@@ -200,10 +199,12 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             return
         }
         posRetries = 0
-        val raw = page.text()
 
-        // Same text as the page we just read: the reader hasn't redrawn yet.
-        if (raw == lastRaw) {
+        // Screen still shows the page we just read (or nothing after the bookmark):
+        // the reader hasn't redrawn yet.
+        val stale = (res.pageKey.isNotEmpty() && res.pageKey == lastPageKey) ||
+            (res.added == 0 && res.fromCursor)
+        if (stale) {
             staleTries++
             if (staleTries <= 2) {
                 scheduleRead(600)
@@ -213,40 +214,31 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             }
             return
         }
+        if (res.added == 0) {
+            retryBlank(); return
+        }
+        blankTries = 0
         staleTries = 0
-        lastRaw = raw
-
-        // Prepend the sentence left unfinished on the previous page.
-        val buf = PageBuffer()
-        if (carry.isNotEmpty()) {
-            buf.append(carry, null, 0, carry.length)
-            if (res.firstTruncated == false) buf.blockBreak() else buf.space()
+        lastPageKey = res.pageKey
+        // Learn how much text a full page holds (used for pages with no positioned text).
+        if (res.pageEnded && !res.pageKey.startsWith("blind") && res.added in 300..6000) {
+            avgPageChars = avgPageChars * 0.7f + res.added * 0.3f
         }
-        buf.appendAll(page)
-        val text = buf.text()
 
+        val text = page.text()
         var segs = TextUtil.segments(text)
-        var newCarry = ""
-        val remainder = res.remainder
-        if (prefs.carryFragments && segs.isNotEmpty()) {
+        var next = res.next
+
+        // A sentence cut off at the page end: stop before it and start the next page there.
+        if (prefs.carryFragments && res.pageEnded && segs.size > 1) {
             val last = segs.last()
-            val incomplete = !TextUtil.endsSentence(text, last.end)
-            if (incomplete && (res.lastTruncated ?: true) &&
-                (last.text.length <= MAX_CARRY || remainder.isNotEmpty())
-            ) {
-                newCarry = last.text
-                segs = segs.dropLast(1)
+            if (!TextUtil.endsSentence(text, last.end) && last.text.length <= MAX_CARRY) {
+                val c = res.cursorFor(page.src.getOrElse(last.start) { -1L })
+                if (c != null) {
+                    next = c
+                    segs = segs.dropLast(1)
+                }
             }
-        }
-        // The rest of a paragraph cut at the page end: hoopla doesn't place it on the next
-        // page, so carry its text over and read it first there.
-        if (remainder.isNotEmpty()) {
-            val sep = if (res.remainderMidWord) "" else " "
-            newCarry = if (newCarry.isEmpty()) remainder else "$newCarry$sep$remainder"
-        }
-        if (newCarry.length > MAX_REMAINDER) {
-            val cut = newCarry.lastIndexOf(' ', MAX_REMAINDER)
-            newCarry = newCarry.substring(0, if (cut > 0) cut else MAX_REMAINDER)
         }
 
         // Look ahead: drop sentences already spoken (text repeated across pages).
@@ -254,9 +246,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         val toSpeak = segs.filterIndexed { i, _ -> !skip[i] }
 
         if (toSpeak.isEmpty()) {
-            if (newCarry.isNotEmpty() && newCarry != carry) {
-                // Only the start of a sentence here; hold it and move on.
-                carry = newCarry
+            if (next != null && next != cursor) {
+                cursor = next
                 emptyTurns = 0
                 turnPage { scheduleRead(prefs.turnDelayMs.toLong()) }
             } else {
@@ -266,8 +257,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         }
 
         emptyTurns = 0
-        pendingCarry = newCarry
-        pageRects = ArrayList(buf.rects)
+        pendingCursor = next
+        pageRects = ArrayList(page.rects)
         pageText = text
         pageSegs = toSpeak
         curSeg = -1
@@ -339,8 +330,8 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         h.removeCallbacks(wordTick)
         if (!playing) return
         highlight?.clear()
-        carry = pendingCarry
-        pendingCarry = ""
+        cursor = pendingCursor
+        pendingCursor = null
         turnPage { scheduleRead(prefs.turnDelayMs.toLong()) }
     }
 
@@ -431,12 +422,17 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
                 sb.appendLine()
                 sb.appendLine("== extracted page ==")
                 val page = PageBuffer()
-                val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, page)
-                sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} webView=${res.usedWebView} firstTruncated=${res.firstTruncated} lastTruncated=${res.lastTruncated}")
+                val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, page, avgPageChars.toInt())
+                sb.appendLine("learned page size: ${avgPageChars.toInt()} chars")
+                sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} webView=${res.usedWebView} pageEnded=${res.pageEnded}")
                 sb.appendLine("word estimate: ${charsPerMs * 1000f} chars/s")
                 sb.appendLine("positions pending: ${res.pending}")
-                sb.appendLine("carried in: \"${Diagnostics.snip(carry)}\"")
-                sb.appendLine("remainder out: \"${Diagnostics.snip(res.remainder)}\"")
+                sb.appendLine("page key: ${res.pageKey} (last accepted: $lastPageKey)")
+                val c = cursor
+                sb.appendLine("bookmark in: " + (if (c == null) "none" else "leaf ${c.leaf} char ${c.char} \"${Diagnostics.snip(c.leafText.drop(c.char))}\""))
+                sb.appendLine("fromBookmark=${res.fromCursor} ${res.note}")
+                val nx = res.next
+                sb.appendLine("bookmark out: " + (if (nx == null) "none" else "leaf ${nx.leaf} char ${nx.char} \"${Diagnostics.snip(nx.leafText.drop(nx.char))}\""))
                 val text = page.text()
                 val segs = TextUtil.segments(text)
                 val skip = TextUtil.repeats(segs.map { TextUtil.key(it.text) }, history)
@@ -496,7 +492,6 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     companion object {
         private const val MAX_CARRY = 400
-        private const val MAX_REMAINDER = 4000
 
         @Volatile
         var instance: ReaderService? = null

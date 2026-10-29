@@ -6,42 +6,46 @@ import kotlin.math.abs
 /** A sentence (or piece of a long one) inside a page buffer: [start, end). */
 data class Seg(val start: Int, val end: Int, val text: String)
 
-/** Page text with one screen rectangle per character (null = unknown / not on this page). */
+/**
+ * Page text with, per character, its screen rectangle (null = unknown / not drawn here)
+ * and its source position in the document (leaf index << 32 | char index, -1 = inserted).
+ */
 class PageBuffer {
     val sb = StringBuilder()
     val rects = ArrayList<RectF?>()
+    val src = ArrayList<Long>()
 
     val length: Int get() = sb.length
 
     fun text(): String = sb.toString()
 
-    private fun put(c: Char, r: RectF?) {
+    private fun put(c: Char, r: RectF?, s: Long) {
         if (c == ' ' && (sb.isEmpty() || sb.last() == ' ' || sb.last() == '\n')) return
         sb.append(c)
         rects.add(r)
+        src.add(s)
     }
 
-    fun append(t: CharSequence, rs: Array<RectF?>?, from: Int, to: Int) {
+    fun append(t: CharSequence, rs: Array<RectF?>?, from: Int, to: Int, leaf: Int = -1) {
+        val base = if (leaf >= 0) leaf.toLong() shl 32 else -1L
         for (i in from until to) {
             val c = t[i]
             if (c == '­' || c == '​' || c == '﻿') continue
-            if (c.isWhitespace()) put(' ', null) else put(c, rs?.getOrNull(i))
+            val s = if (base >= 0) base or i.toLong() else -1L
+            if (c.isWhitespace()) put(' ', null, s) else put(c, rs?.getOrNull(i), s)
         }
     }
 
-    fun appendAll(o: PageBuffer) {
-        for (i in 0 until o.length) put(o.sb[i], o.rects[i])
-    }
-
-    fun space() = put(' ', null)
+    fun space() = put(' ', null, -1L)
 
     fun blockBreak() {
         while (sb.isNotEmpty() && sb.last() == ' ') {
             sb.setLength(sb.length - 1)
             rects.removeAt(rects.size - 1)
+            src.removeAt(src.size - 1)
         }
         if (sb.isNotEmpty() && sb.last() != '\n') {
-            sb.append('\n'); rects.add(null)
+            sb.append('\n'); rects.add(null); src.add(-1L)
         }
     }
 }

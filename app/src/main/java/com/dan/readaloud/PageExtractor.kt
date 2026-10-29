@@ -6,45 +6,66 @@ import android.os.Bundle
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * Pulls the text that is actually on screen out of the reading app's accessibility tree.
+ * Pulls the text of the current page out of the reading app's accessibility tree.
  *
- * What hoopla (a WebView) exposes, from a diagnostic dump:
- *  - The whole chapter is in the tree. Pages before/after the visible one are squashed
- *    into 0–2 px strips at the left/right screen edge; their characters get zero- or
- *    2-px-wide rectangles.
- *  - Spaces at line wraps report the whole paragraph's box (tall, full width).
- *  - The chapter title and page counter are native views outside the WebView.
+ * What hoopla (a WebView) exposes, from diagnostic dumps:
+ *  - The whole chapter is in the tree, in reading order, on every page.
+ *  - Pages before/after the visible one are squashed into 0–2 px strips at the
+ *    left/right screen edge.
+ *  - Line-wrap spaces report the whole paragraph's box.
+ *  - The part of a paragraph that continues onto the next page is mis-positioned:
+ *    drawn over the current page, and on the next page reported as the previous page.
+ *  - Right after a page turn, glyph positions aren't loaded yet (every character
+ *    reports the paragraph box) for a fraction of a second.
  *
- * So: read only inside the WebView, ignore degenerate/oversized character boxes, and
- * treat the visible page as one contiguous run of the document — once text has started,
- * the first character that lands off the page (or on top of text already taken, i.e. a
- * later page drawn at the same spot) ends the page.
+ * So positions can't be trusted to say where a page STARTS. Instead the reader keeps a
+ * bookmark (paragraph + character) of where the previous page stopped, and reads on from
+ * there. Positions are used only to find where the page ENDS, and for highlighting.
+ * Without a bookmark (first page, or after jumping around) the start is the first
+ * character actually positioned on screen.
  */
 object PageExtractor {
+    /** A position in the document: leaf (text node) index + character, with the leaf's text to re-identify it. */
+    data class Cursor(val leaf: Int, val char: Int, val leafText: String)
+
     class Result(
         val added: Int,
-        /** First block starts partway through its node (continues from the previous page). null = unknown. */
-        val firstTruncated: Boolean?,
-        /** Last block is cut off at the page end. null = unknown. */
-        val lastTruncated: Boolean?,
         val hasCharPositions: Boolean,
         val usedWebView: Boolean,
-        /** Rest of the paragraph that was cut at the page end (continues on the next page). */
-        val remainder: String,
-        /** The cut fell inside a word: join the remainder without a space. */
-        val remainderMidWord: Boolean,
-        /** Some paragraphs' character positions weren't loaded yet; reading again shortly will be more accurate. */
+        /** Some paragraphs' glyph positions weren't loaded yet; reading again shortly will be more accurate. */
         val pending: Boolean,
-    )
+        /** Started from the bookmark rather than from the screen. */
+        val fromCursor: Boolean,
+        /** Stopped because the page ended (more text follows). */
+        val pageEnded: Boolean,
+        /** Where the next page starts; null = end of the text. */
+        val next: Cursor?,
+        /** Identity of the first character drawn on screen: changes when the page turns. */
+        val pageKey: String,
+        val leafTexts: List<String>,
+        val note: String,
+    ) {
+        fun cursorFor(src: Long): Cursor? {
+            if (src < 0) return null
+            val li = (src ushr 32).toInt()
+            val ci = (src and 0xffffffffL).toInt()
+            return if (li in leafTexts.indices) Cursor(li, ci, leafTexts[li]) else null
+        }
+    }
 
     private class Leaf(val node: AccessibilityNodeInfo, val text: CharSequence, val bounds: Rect)
 
     private const val KEY = AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_KEY
     private const val CHUNK = 1000
     private const val MIN_W = 3f
+    private const val BACK_WINDOW = 2500   // bookmark may be this many chars before the screen start
+    private const val AHEAD_WINDOW = 1500  // ...or this many after it
     private val skipClasses = listOf("Button", "EditText", "Image", "SeekBar", "ProgressBar", "Switch", "CheckBox")
 
-    fun extract(root: AccessibilityNodeInfo, window: Rect, topPct: Int, bottomPct: Int, into: PageBuffer): Result {
+    fun extract(
+        root: AccessibilityNodeInfo, window: Rect, topPct: Int, bottomPct: Int,
+        cursor: Cursor?, into: PageBuffer, pageChars: Int = 1500,
+    ): Result {
         val web = findContentWebView(root)
         val band: Rect
         val start: AccessibilityNodeInfo
@@ -61,123 +82,204 @@ object PageExtractor {
 
         val leaves = ArrayList<Leaf>()
         collect(start, leaves, band, 0)
+        val texts = leaves.map { it.text.toString() }
+        val n = leaves.size
 
+        var pending = false
+        var anyChars = false
+        val cache = arrayOfNulls<Array<RectF?>>(n)
+        val queried = BooleanArray(n)
+        fun rectsFor(i: Int): Array<RectF?>? {
+            if (queried[i]) return cache[i]
+            queried[i] = true
+            val l = leaves[i]
+            if (l.bounds.width() < 8) return null           // squashed: another page
+            val raw = charRects(l.node, l.text.length) ?: return null
+            anyChars = true
+            if (notLoaded(raw)) {
+                pending = true
+                return null
+            }
+            val s = sanitize(raw)
+            cache[i] = s
+            return s
+        }
+        fun rightClamped(l: Leaf) = l.bounds.width() < 8 && l.bounds.left >= band.right - 4
+        fun onScreen(r: RectF) = band.contains(r.centerX().toInt(), r.centerY().toInt())
+
+        // 1. Where the screen says the page starts.
+        var gLeaf = -1
+        var gChar = 0
+        for (i in 0 until n) {
+            val l = leaves[i]
+            if (rightClamped(l)) break
+            val rs = rectsFor(i)
+            if (rs != null) {
+                val j = rs.indices.firstOrNull { k -> rs[k]?.let { onScreen(it) } == true }
+                if (j != null) { gLeaf = i; gChar = j; break }
+            } else if (l.bounds.width() >= 8 && band.contains(l.bounds.centerX(), l.bounds.centerY())) {
+                gLeaf = i; gChar = 0; break
+            }
+        }
+        var pageKey = if (gLeaf >= 0) "$gLeaf:$gChar:${texts[gLeaf].hashCode()}" else ""
+
+        // 2. Use the bookmark if it is close to that.
+        val prefix = IntArray(n + 1)
+        for (i in 0 until n) prefix[i + 1] = prefix[i] + texts[i].length
+        var sLeaf = gLeaf
+        var sChar = gChar
+        var fromCursor = false
+        var note = ""
+        var blindParagraph = false
+        if (cursor != null && gLeaf < 0) {
+            // Nothing positioned on screen: the page is the middle of one long paragraph
+            // that hoopla files under an earlier page. Read on from the bookmark to the end
+            // of that paragraph.
+            val idx = if (cursor.leaf in 0 until n && texts[cursor.leaf] == cursor.leafText) cursor.leaf
+            else texts.indexOf(cursor.leafText)
+            if (idx >= 0) {
+                sLeaf = idx; sChar = cursor.char; fromCursor = true; blindParagraph = true
+                pageKey = "blind:$idx:${cursor.char}"
+                note = "no positioned text; reading bookmark paragraph"
+            }
+        }
+        if (cursor != null && gLeaf >= 0) {
+            val idx = if (cursor.leaf in 0 until n && texts[cursor.leaf] == cursor.leafText) cursor.leaf
+            else texts.indexOf(cursor.leafText)
+            if (idx >= 0) {
+                val posC = prefix[idx] + cursor.char.coerceIn(0, texts[idx].length)
+                val posG = prefix[gLeaf] + gChar
+                if (posC >= posG - BACK_WINDOW && posC <= posG + AHEAD_WINDOW) {
+                    sLeaf = idx; sChar = cursor.char; fromCursor = true
+                    note = "bookmark ${posC - posG} chars from screen start"
+                } else note = "bookmark too far (${posC - posG}); using screen start"
+            } else note = "bookmark paragraph not found; using screen start"
+        }
+        if (sLeaf < 0) {
+            return Result(0, anyChars, web != null, pending, false, false, null, pageKey, texts, "no text on screen")
+        }
+
+        // 3. Read on until the page ends.
         val occupied = Occupancy()
         val startLen = into.length
-        var firstTrunc: Boolean? = null
-        var lastTrunc: Boolean? = null
-        var prevLast: RectF? = null
-        var started = false
-        var anyChars = false
-        var remainder = ""
-        var remainderMidWord = false
-        var pending = false
-        // Top/height of the last character taken. Text only flows downward within a page,
-        // so a character above this line belongs to another page (hoopla mis-positions the
-        // continuation of a split paragraph on top of the current page).
+        var seenOnPage = false
         var lastTop = Float.NaN
         var lastH = 0f
+        var started = false
+        var prevLast: RectF? = null
+        var prevEndsSpace = false
+        var ended = false
+        var next: Cursor? = null
 
-        for (leaf in leaves) {
-            val t = leaf.text
-            var raw = charRects(leaf.node, t.length)
-            if (raw != null && leaf.bounds.width() >= 8 && notLoaded(raw)) {
-                // WebView hasn't computed glyph positions for this paragraph yet.
-                pending = true
-                raw = null
+        // Bookmark is partway down this page (the top was already read): mark that text's
+        // spots as taken so a misplaced continuation landing there is still caught.
+        if (fromCursor && gLeaf >= 0 && (sLeaf > gLeaf || (sLeaf == gLeaf && sChar > gChar))) {
+            for (li in gLeaf..sLeaf) {
+                val rs = rectsFor(li) ?: continue
+                val a = if (li == gLeaf) gChar else 0
+                val b = if (li == sLeaf) sChar.coerceAtMost(rs.size) else rs.size
+                for (i in a until b) {
+                    val r = rs[i] ?: continue
+                    if (!onScreen(r)) continue
+                    occupied.add(r)
+                    lastTop = r.top
+                    lastH = r.height()
+                    seenOnPage = true
+                }
             }
-            var from: Int
-            var to: Int
-            var startTrunc: Boolean? = null
-            var endTrunc: Boolean? = null
-            var firstRect: RectF? = null
-            var lastRect: RectF? = null
-            var pageEnds = false
-            var clean: Array<RectF?>? = null
+        }
 
-            if (raw != null) {
-                anyChars = true
-                val cr = sanitize(raw)
-                clean = cr
-                var first = -1
-                var last = -1
-                var hasValid = false
-                for (i in cr.indices) {
-                    val r = cr[i] ?: continue
-                    hasValid = true
-                    val jumpedUp = !lastTop.isNaN() && r.centerY() < lastTop - 0.25f * lastH
-                    val onPage = !jumpedUp &&
-                        band.contains(r.centerX().toInt(), r.centerY().toInt()) &&
-                        !occupied.hits(r.centerX(), r.centerY())
-                    if (onPage) {
-                        if (first < 0) first = i
-                        last = i
+        for (li in sLeaf until n) {
+            val l = leaves[li]
+            val t = l.text
+            val from = if (li == sLeaf) sChar.coerceIn(0, t.length) else 0
+            if (from >= t.length) continue
+            if (seenOnPage && rightClamped(l)) {
+                ended = true; next = Cursor(li, 0, texts[li]); break
+            }
+            val rs = rectsFor(li)
+            val keep = arrayOfNulls<RectF>(t.length)
+            var cut = t.length
+            if (blindParagraph && t.length - from > pageChars) {
+                // About one page's worth, ending at a word break.
+                var c = from + pageChars
+                while (c > from + pageChars / 2 && !t[c - 1].isWhitespace()) c--
+                cut = c
+            }
+            var firstR: RectF? = null
+            var lastR: RectF? = null
+
+            if (rs == null) {
+                if (l.bounds.width() >= 8) {
+                    // On screen but no usable positions: whole paragraph, by its box.
+                    if (seenOnPage && !lastTop.isNaN() && l.bounds.top < lastTop - 0.25f * lastH) {
+                        ended = true; next = Cursor(li, from, texts[li]); break
+                    }
+                    if (band.contains(l.bounds.centerX(), l.bounds.centerY())) {
+                        seenOnPage = true
+                        lastTop = l.bounds.top.toFloat()
+                        lastH = 0f
+                    }
+                }
+                // Squashed paragraphs before the screen text are read too: they are
+                // the part between the bookmark and this page that hoopla misplaces.
+            } else {
+                for (i in from until t.length) {
+                    val r = rs[i] ?: continue
+                    // Off the visible area, or drawn on top of text already taken (hoopla puts
+                    // the next page's continuation of a paragraph over the current page).
+                    val on = onScreen(r) && !occupied.hits(r.centerX(), r.centerY())
+                    if (on) {
+                        keep[i] = r
                         occupied.add(r)
                         lastTop = r.top
                         lastH = r.height()
-                    } else if (first >= 0) {
-                        pageEnds = true   // text ran off this page
+                        seenOnPage = true
+                        if (firstR == null) firstR = r
+                        lastR = r
+                    } else if (seenOnPage) {
+                        cut = i   // ran off this page
                         break
                     }
+                    // else: before the page's first drawn character (bookmark region): keep the text.
                 }
-                if (first < 0) {
-                    // Nothing of this node is on the visible page.
-                    if (started && hasValid) break      // a later page: we're done
-                    if (started && leaf.bounds.width() < 8) break
-                    continue                             // an earlier page: keep looking
-                }
-                from = first
-                to = last + 1
-                var lead = 0
-                while (lead < t.length && t[lead].isWhitespace()) lead++
-                var tail = t.length - 1
-                while (tail >= 0 && t[tail].isWhitespace()) tail--
-                // Unknown-position characters (spaces) at either end belong with the run.
-                while (from > lead && cr[from - 1] == null && !t[from - 1].isLetterOrDigit()) from--
-                while (to <= tail && cr[to] == null && !t[to].isLetterOrDigit()) to++
-                startTrunc = from > lead
-                endTrunc = pageEnds || to <= tail
-                firstRect = cr[first]
-                lastRect = cr[last]
-            } else {
-                // No character positions: whole node if its box is really on screen.
-                if (leaf.bounds.width() < 8 || !band.contains(leaf.bounds.centerX(), leaf.bounds.centerY())) {
-                    if (started && leaf.bounds.width() < 8) break
-                    continue
-                }
-                if (!lastTop.isNaN() && leaf.bounds.top < lastTop - 0.25f * lastH) break
-                lastTop = leaf.bounds.top.toFloat()
-                lastH = 0f
-                from = 0
-                to = t.length
             }
 
-            if (started) {
-                // Same line as the previous piece = inline element (italics, link): join directly.
-                val pl = prevLast
-                val inline = pl != null && firstRect != null &&
-                    firstRect.centerY() > pl.top && firstRect.centerY() < pl.bottom
-                if (!inline) into.blockBreak()
-            } else {
-                if (into.length > 0) into.space()
-                firstTrunc = startTrunc
+            if (cut > from) {
+                if (started) {
+                    val pl = prevLast
+                    val geomInline = pl != null && firstR != null &&
+                        firstR.centerY() > pl.top && firstR.centerY() < pl.bottom
+                    val c0 = t[from]
+                    val textInline = prevEndsSpace || c0.isWhitespace() || ",.;:!?’”)]".indexOf(c0) >= 0
+                    if (!geomInline && !textInline) into.blockBreak()
+                } else if (into.length > 0) {
+                    into.space()
+                }
+                into.append(t, keep, from, cut, li)
+                started = true
+                if (lastR != null) prevLast = lastR
+                prevEndsSpace = t[cut - 1].isWhitespace()
             }
-            into.append(t, clean, from, to)
-            started = true
-            prevLast = lastRect
-            lastTrunc = endTrunc
-            if (endTrunc == true && to < t.length) {
-                remainder = t.subSequence(to, t.length).toString().trim()
-                remainderMidWord = to > 0 && t[to - 1].isLetterOrDigit() && t[to].isLetterOrDigit()
-            } else {
-                remainder = ""
-                remainderMidWord = false
+            if (cut < t.length) {
+                ended = true; next = Cursor(li, cut, texts[li]); break
             }
-            if (pageEnds) break
+            if (blindParagraph) {
+                // Ran to the end of the paragraph.
+                ended = li + 1 < n
+                next = if (li + 1 < n) Cursor(li + 1, 0, texts[li + 1]) else null
+                break
+            }
+        }
+        if (!seenOnPage && fromCursor && !blindParagraph) {
+            // Bookmark is past everything on screen: the page hasn't turned yet.
+            into.sb.setLength(startLen); into.rects.subList(startLen, into.rects.size).clear()
+            into.src.subList(startLen, into.src.size).clear()
+            return Result(0, anyChars, web != null, pending, true, false, cursor, pageKey, texts, "$note; nothing on screen after bookmark")
         }
         return Result(
-            into.length - startLen, firstTrunc, lastTrunc, anyChars, web != null,
-            remainder, remainderMidWord, pending
+            into.length - startLen, anyChars, web != null, pending, fromCursor,
+            ended, next, pageKey, texts, note
         )
     }
 
@@ -268,7 +370,7 @@ object PageExtractor {
         if (depth > 150 || !n.isVisibleToUser) return false
         val r = Rect()
         n.getBoundsInScreen(r)
-        // Keep squashed (0–2 px wide) nodes at the screen edges: they mark earlier/later pages.
+        // Keep squashed (0–2 px wide) nodes at the screen edges: they are the rest of the chapter.
         if (r.bottom < band.top || r.top > band.bottom || r.right < band.left || r.left > band.right) return false
         val cls = n.className?.toString().orEmpty()
         if (skipClasses.any { cls.contains(it) }) return false
