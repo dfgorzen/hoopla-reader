@@ -60,6 +60,7 @@ object PageExtractor {
     private const val KEY = AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_KEY
     private const val CHUNK = 1000
     private const val MIN_W = 3f
+    private const val AREA_SLACK = 24   // px of tolerance around the text area
     private const val BACK_WINDOW = 2500   // bookmark may be this many chars before the screen start
     private const val AHEAD_WINDOW = 1500  // ...or this many after it
     private val skipClasses = listOf("Button", "EditText", "Image", "SeekBar", "ProgressBar", "Switch", "CheckBox")
@@ -82,8 +83,20 @@ object PageExtractor {
             start = root
         }
 
+        // The book's text area (hoopla: #hoopla-container). Text never extends past it, so its
+        // bottom is the real bottom of the page, and a paragraph whose box sits inside it is
+        // entirely on this page even when its glyph positions are garbled.
+        val area: Rect? = if (web != null) findTextArea(web, band) else null
+        // Collect against the whole WebView (squashed off-page paragraphs sit anywhere in it,
+        // and every one of them must stay in the chapter list); test "on page" against the text area.
+        val collectBand = Rect(band)
+        if (area != null) {
+            band.top = maxOf(band.top, area.top - AREA_SLACK)
+            band.bottom = minOf(band.bottom, area.bottom + AREA_SLACK)
+        }
+
         val leaves = ArrayList<Leaf>()
-        collect(start, leaves, band, 0)
+        collect(start, leaves, collectBand, 0)
         val texts = leaves.map { it.text.toString() }
         val n = leaves.size
 
@@ -258,11 +271,25 @@ object PageExtractor {
                 // Squashed paragraphs before the screen text are read too: they are
                 // the part between the bookmark and this page that hoopla misplaces.
             } else {
+                // Paragraph box entirely inside the text area: all of it is on this page.
+                val wholeOnPage = area != null && l.bounds.width() >= 8 &&
+                    l.bounds.top >= area.top - AREA_SLACK && l.bounds.bottom <= area.bottom + AREA_SLACK
+                if (wholeOnPage) seenOnPage = true
                 for (i in from until t.length) {
                     val r = rs[i] ?: continue
                     // Off the visible area, or drawn on top of text already taken (hoopla puts
                     // the next page's continuation of a paragraph over the current page).
                     val on = onScreen(r) && !occupied.hits(r.centerX(), r.centerY())
+                    if (wholeOnPage) {
+                        // Never cut inside it; just keep the believable glyph boxes for highlighting.
+                        if (on) {
+                            keep[i] = r; accepted.add(r); occupied.add(r)
+                            lastTop = r.top; lastH = r.height(); lastRect = r
+                            if (firstR == null) firstR = r
+                            lastR = r
+                        }
+                        continue
+                    }
                     if (on) {
                         keep[i] = r
                         accepted.add(r)
@@ -330,6 +357,24 @@ object PageExtractor {
             into.length - startLen, anyChars, web != null, pending, fromCursor,
             ended, next, pageKey, texts, note, gPlace
         )
+    }
+
+    /**
+     * The container holding the chapter's paragraphs: below the WebView, the first node
+     * with many children. Must be a sizeable box on screen to count.
+     */
+    private fun findTextArea(web: AccessibilityNodeInfo, band: Rect): Rect? {
+        var n: AccessibilityNodeInfo = web
+        for (depth in 0 until 8) {
+            if (n.childCount > 3) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                return if (r.width() > band.width() / 2 && r.height() > band.height() / 3) r else null
+            }
+            if (n.childCount != 1) return null
+            n = n.getChild(0) ?: return null
+        }
+        return null
     }
 
     /** Largest visible WebView: the book page. Null for native readers. */
