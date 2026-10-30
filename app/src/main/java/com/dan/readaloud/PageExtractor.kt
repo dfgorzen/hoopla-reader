@@ -162,8 +162,7 @@ object PageExtractor {
             // Nothing positioned on screen: the page is the middle of one long paragraph
             // that hoopla files under an earlier page. Read on from the bookmark to the end
             // of that paragraph.
-            val idx = if (cursor.leaf in 0 until n && texts[cursor.leaf] == cursor.leafText) cursor.leaf
-            else texts.indexOf(cursor.leafText)
+            val idx = findLeaf(texts, cursor)
             if (idx >= 0) {
                 sLeaf = idx; sChar = cursor.char; fromCursor = true; blindParagraph = true
                 pageKey = "blind:$idx:${cursor.char}"
@@ -171,8 +170,7 @@ object PageExtractor {
             }
         }
         if (cursor != null && gLeaf >= 0) {
-            val idx = if (cursor.leaf in 0 until n && texts[cursor.leaf] == cursor.leafText) cursor.leaf
-            else texts.indexOf(cursor.leafText)
+            val idx = findLeaf(texts, cursor)
             if (idx >= 0) {
                 val posC = prefix[idx] + cursor.char.coerceIn(0, texts[idx].length)
                 val posG = prefix[gLeaf] + gChar
@@ -385,6 +383,16 @@ object PageExtractor {
         return null
     }
 
+    /** The bookmark's paragraph: same index if unchanged, else the matching text nearest to it. */
+    fun findLeaf(texts: List<String>, c: Cursor): Int {
+        if (c.leaf in texts.indices && texts[c.leaf] == c.leafText) return c.leaf
+        var best = -1
+        for (i in texts.indices) {
+            if (texts[i] == c.leafText && (best < 0 || kotlin.math.abs(i - c.leaf) < kotlin.math.abs(best - c.leaf))) best = i
+        }
+        return best
+    }
+
     /** Largest visible WebView: the book page. Null for native readers. */
     private fun findContentWebView(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var best: AccessibilityNodeInfo? = null
@@ -504,7 +512,9 @@ object PageExtractor {
 
     /** Depth-first, document order. Keeps the deepest nodes that carry text. */
     private fun collect(n: AccessibilityNodeInfo, out: MutableList<Leaf>, band: Rect, depth: Int): Boolean {
-        if (depth > 150 || !n.isVisibleToUser) return false
+        // No isVisibleToUser check: hoopla marks off-page paragraph containers invisible even
+        // when one of their pieces is on screen, and the full chapter list must stay stable.
+        if (depth > 150) return false
         val r = Rect()
         n.getBoundsInScreen(r)
         // Keep squashed (0–2 px wide) nodes at the screen edges: they are the rest of the chapter.

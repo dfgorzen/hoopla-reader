@@ -278,7 +278,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
             root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, page, avgPageChars.toInt()
         )
         // Glyph positions still loading after the page turn: check again shortly.
-        if (res.pending && posRetries < 8) {
+        if (res.pending && posRetries < 4) {
             posRetries++
             pendingCount++
             scheduleRead(POLL_MS.toLong())
@@ -590,7 +590,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         val texts = chapterTexts
         val c = cursor
         if (texts == null || c == null) { blindEnd(false); return }
-        val idx = if (c.leaf in texts.indices && texts[c.leaf] == c.leafText) c.leaf else texts.indexOf(c.leafText)
+        val idx = PageExtractor.findLeaf(texts, c)
         if (idx < 0) { blindEnd(false); return }
 
         val buf = PageBuffer()
