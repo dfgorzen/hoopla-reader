@@ -61,7 +61,7 @@ class Speaker(context: Context, private val onReady: (Boolean) -> Unit) : Uttera
         }
         tts.setSpeechRate(rate)
         parts.forEachIndexed { i, p ->
-            tts.speak(p, TextToSpeech.QUEUE_ADD, null, "$b:$i")
+            tts.speak(TextUtil.speakable(p), TextToSpeech.QUEUE_ADD, null, "$b:$i")
         }
     }
 

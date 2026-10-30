@@ -66,7 +66,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
     private var wakeLock: PowerManager.WakeLock? = null
     private var volUpDown = false
     private var volDownDown = false
-    private val catchRunnable = Runnable { catchStep() }
+    private val catchRunnable = Runnable { safely("catching up") { catchStep() } }
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
             when (i?.action) {
@@ -106,7 +106,22 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         }
     }
 
-    private val readRunnable = Runnable { readCurrentPage() }
+    private val readRunnable = Runnable { safely("reading page") { readCurrentPage() } }
+    private var lastError = "none"
+
+    /** A confusing page must never crash the service (Android would switch it off). */
+    private fun safely(what: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) {
+            lastError = "$what: $e"
+            android.util.Log.w("ReadAloud", lastError, e)
+            if (playing) {
+                pause()
+                toast("Read Aloud hit a problem on this page and paused. Long-press ⏭ to save a dump.")
+            }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -137,8 +152,10 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        val pkg = targetRoot()?.packageName?.toString() ?: event.packageName?.toString() ?: return
-        updateOverlayFor(pkg)
+        safely("window change") {
+            val pkg = targetRoot()?.packageName?.toString() ?: event.packageName?.toString() ?: return@safely
+            updateOverlayFor(pkg)
+        }
     }
 
     private fun updateOverlayFor(pkg: String?) {
@@ -428,7 +445,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         cursor = pendingCursor
         pendingCursor = null
         if (blindMode) {
-            h.post { speakBlindNext() }
+            h.post { safely("screen-off reading") { speakBlindNext() } }
             return
         }
         turnPage { afterTurn() }
@@ -549,7 +566,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         h.removeCallbacks(catchRunnable)
         // A page still being spoken finishes first (onAllDone continues from memory);
         // otherwise we were between pages: carry on from the bookmark now.
-        if (!speaking) speakBlindNext()
+        if (!speaking) safely("screen-off reading") { speakBlindNext() }
     }
 
     private fun onUnlocked() {
@@ -616,7 +633,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
         val toSpeak = batch.filterIndexed { i, _ -> !skip[i] }
         if (toSpeak.isEmpty()) {
             cursor = pendingCursor
-            if (nextSeg == null && reachedEnd) blindEnd(true) else h.post { speakBlindNext() }
+            if (nextSeg == null && reachedEnd) blindEnd(true) else h.post { safely("screen-off reading") { speakBlindNext() } }
             return
         }
         pageRects = emptyList()   // nothing to highlight with the screen off
@@ -734,6 +751,7 @@ class ReaderService : AccessibilityService(), Speaker.Listener {
                 val page = PageBuffer()
                 val res = PageExtractor.extract(root, win, prefs.topMarginPct, prefs.bottomMarginPct, cursor, page, avgPageChars.toInt())
                 sb.appendLine("learned page size: ${avgPageChars.toInt()} chars")
+                sb.appendLine("last error: $lastError")
                 sb.appendLine("last page turn: $lastTurnReport")
                 sb.appendLine("chars=${res.added} charPositions=${res.hasCharPositions} webView=${res.usedWebView} pageEnded=${res.pageEnded}")
                 sb.appendLine("word estimate: ${charsPerMs * 1000f} chars/s")

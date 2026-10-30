@@ -171,6 +171,28 @@ object TextUtil {
         if (t.any { it.isLetterOrDigit() }) out.add(Seg(a, b, t))
     }
 
+    /**
+     * Text as it should be spoken: hyphens, brackets and quote marks become spaces, and dashes
+     * become a comma (a short pause), so the voice doesn't read them out. Apostrophes inside
+     * words (don't, Nicole's) are kept. Length is unchanged, so word positions still line up
+     * with the page for highlighting.
+     */
+    fun speakable(s: String): String {
+        val c = s.toCharArray()
+        for (i in c.indices) {
+            val prevL = i > 0 && s[i - 1].isLetterOrDigit()
+            val nextL = i < s.length - 1 && s[i + 1].isLetterOrDigit()
+            when (s[i]) {
+                '-', '‐', '‑', '−' -> c[i] = ' '
+                '‒', '–', '—', '―' -> c[i] = ','
+                '(', ')', '[', ']', '{', '}', '"', '“', '”', '„', '«', '»',
+                '‹', '›', '*', '_', '/', '\\', '|', '~' -> c[i] = ' '
+                '\'', '‘', '’', '`', '´' -> c[i] = if (prevL && nextL) '\'' else ' '
+            }
+        }
+        return String(c)
+    }
+
     /** Comparison key: letters and digits only, lowercase. */
     fun key(t: String): String {
         val sb = StringBuilder(t.length)
