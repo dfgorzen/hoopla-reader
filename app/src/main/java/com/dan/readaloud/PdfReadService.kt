@@ -36,6 +36,8 @@ class PdfReadService : Service(), Speaker.Listener {
         fun onWord(page: Int, start: Int, end: Int) {}
         fun onState(playing: Boolean) {}
         fun onMessage(msg: String) {}
+        /** Page text changed (skip list edited): fetch it again. */
+        fun onPageReload(page: Int) {}
     }
 
     inner class LocalBinder : Binder() {
@@ -155,6 +157,8 @@ class PdfReadService : Service(), Speaker.Listener {
             d.topPct = prefs.topMarginPct
             d.bottomPct = prefs.bottomMarginPct
             d.dropRunningHeads = prefs.pdfSkipHeads
+            val skips = prefs.pdfSkips(file.absolutePath)
+            if (skips.isNotEmpty()) d.setSkipKeys(skips)
             val err = d.open()
             main.post {
                 if (token != loadToken) {
@@ -182,6 +186,41 @@ class PdfReadService : Service(), Speaker.Listener {
         exec.execute {
             val p = try { d.page(i) } catch (_: Exception) { PdfPage("", emptyList(), false) }
             main.post { cb(p) }
+        }
+    }
+
+    /** Leave out text like this on every page of the current PDF. */
+    fun addSkip(text: String) {
+        val p = path ?: return
+        val k = PdfDoc.keyOf(text)
+        if (k.isEmpty()) return
+        prefs.addPdfSkip(p, k)
+        applySkips()
+    }
+
+    fun clearSkips() {
+        val p = path ?: return
+        prefs.clearPdfSkips(p)
+        applySkips()
+    }
+
+    private fun applySkips() {
+        val d = doc ?: return
+        val p = path ?: return
+        val keys = prefs.pdfSkips(p)
+        val sentence = pageSegs.getOrNull(curSeg)?.text
+        val pg = page
+        exec.execute {
+            d.setSkipKeys(keys)
+            val data = try { d.page(pg) } catch (_: Exception) { PdfPage("", emptyList(), false) }
+            main.post {
+                listeners.forEach { it.onPageReload(pg) }
+                if (playing && page == pg) {
+                    // Carry on from the same sentence in the re-filtered page.
+                    val pos = sentence?.let { data.text.indexOf(it) }?.takeIf { it >= 0 } ?: 0
+                    seek(pg, pos)
+                }
+            }
         }
     }
 

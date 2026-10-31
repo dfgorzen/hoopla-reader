@@ -85,7 +85,10 @@ class PdfActivity : Activity(), PdfReadService.Listener {
             setPadding(dp(16), dp(10), dp(16), dp(6))
             maxLines = 2
         }
-        pageView = PageView(this).apply { onTap = { x, y -> tapAt(x, y) } }
+        pageView = PageView(this).apply {
+            onTap = { x, y -> tapAt(x, y) }
+            onLongPress = { x, y -> markLine(x, y) }
+        }
         scroll = ScrollView(this).apply {
             setBackgroundColor(Color.DKGRAY)
             addView(pageView)
@@ -235,6 +238,16 @@ class PdfActivity : Activity(), PdfReadService.Listener {
         playBtn.text = if (playing) PAUSE else PLAY
     }
 
+    override fun onPageReload(page: Int) {
+        if (page != shownPage) return
+        service?.pageData(page) { d ->
+            if (page == shownPage) {
+                pageData = d
+                applyHighlight(false)
+            }
+        }
+    }
+
     override fun onMessage(msg: String) {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     }
@@ -306,9 +319,8 @@ class PdfActivity : Activity(), PdfReadService.Listener {
         }
     }
 
-    /** Tap on the page: read from the start of that sentence. */
-    private fun tapAt(x: Float, y: Float) {
-        val d = pageData ?: return
+    /** Index of the character nearest to (x, y), or -1 if nothing is close. */
+    private fun charAt(d: PdfPage, x: Float, y: Float): Int {
         var best = -1
         var bestD = Float.MAX_VALUE
         for (i in d.boxes.indices) {
@@ -318,7 +330,45 @@ class PdfActivity : Activity(), PdfReadService.Listener {
             val dist = dx * dx + dy * dy
             if (dist < bestD) { bestD = dist; best = i }
         }
-        if (best < 0 || bestD > 0.003f) return
+        return if (best < 0 || bestD > 0.003f) -1 else best
+    }
+
+    /** Long-press: offer to skip that line (e.g. a running header) on every page. */
+    private fun markLine(x: Float, y: Float) {
+        val d = pageData ?: return
+        val hit = charAt(d, x, y)
+        if (hit < 0) return
+        val ref = d.boxes[hit] ?: return
+        fun sameLine(i: Int): Boolean {
+            val b = d.boxes[i] ?: return d.text[i] == ' '
+            return kotlin.math.abs(b.centerY() - ref.centerY()) < ref.height() * 0.5f
+        }
+        var a = hit
+        var b = hit + 1
+        while (a > 0 && d.text[a - 1] != '\n' && sameLine(a - 1)) a--
+        while (b < d.text.length && d.text[b] != '\n' && sameLine(b)) b++
+        val text = d.text.substring(a, b).trim()
+        if (text.isEmpty()) return
+        pageView.marked = TextUtil.lineRects(d.boxes, a, b)
+        pageView.invalidate()
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Skip this text?")
+            .setMessage("\u201C$text\u201D\n\nLines like this (page numbers ignored) will be left out on every page of this PDF.")
+            .setPositiveButton("Skip it") { _, _ -> service?.addSkip(text) }
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Clear skip list") { _, _ ->
+                service?.clearSkips()
+                Toast.makeText(this, "Skip list cleared for this PDF", Toast.LENGTH_SHORT).show()
+            }
+            .setOnDismissListener { pageView.marked = emptyList(); pageView.invalidate() }
+            .show()
+    }
+
+    /** Tap on the page: read from the start of that sentence. */
+    private fun tapAt(x: Float, y: Float) {
+        val d = pageData ?: return
+        val best = charAt(d, x, y)
+        if (best < 0) return
         val seg = TextUtil.segments(d.text).firstOrNull { best >= it.start && best < it.end } ?: return
         service?.seek(shownPage, seg.start, andPlay = true)
     }

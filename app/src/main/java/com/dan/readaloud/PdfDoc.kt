@@ -51,6 +51,16 @@ class PdfDoc(private val ctx: Context, val file: File) {
     @Volatile var bottomPct = 6
     /** Drop lines near the top/bottom that repeat on nearby pages, and bare page numbers. */
     @Volatile var dropRunningHeads = true
+    /** Line keys the user marked to skip (see [keyOf]). */
+    @Volatile var skipKeys: Set<String> = emptySet()
+        private set
+
+    /** Change the skip list; call on the document thread. */
+    fun setSkipKeys(keys: Set<String>) {
+        skipKeys = keys
+        cache.clear()
+        order.clear()
+    }
 
     /** Opens the file. Returns an error message, or null on success. */
     fun open(): String? {
@@ -85,7 +95,9 @@ class PdfDoc(private val ctx: Context, val file: File) {
     fun page(i: Int): PdfPage {
         cache[i]?.let { return it }
         val raw = raw(i)
-        val drop = if (dropRunningHeads) runningHeads(i, raw) else emptySet()
+        val drop = HashSet<Int>()
+        if (dropRunningHeads) drop.addAll(runningHeads(i, raw))
+        if (skipKeys.isNotEmpty()) drop.addAll(userSkips(raw))
         val p = build(raw, drop)
         cache[i] = p
         order.addLast(i)
@@ -111,6 +123,20 @@ class PdfDoc(private val ctx: Context, val file: File) {
                 .map { edgeKeys(it) }
                 .also { neighbours = it }
             if (nb.any { k in it }) out.add(li)
+        }
+        return out
+    }
+
+    /** Lines matching the user's skip list: exact anywhere, or containing it near the edges. */
+    private fun userSkips(raw: RawPage): Set<Int> {
+        val keys = skipKeys
+        val out = HashSet<Int>()
+        for ((li, line) in raw.lines.withIndex()) {
+            val k = key(raw.sb, line)
+            if (k.isEmpty()) continue
+            if (k in keys) { out.add(li); continue }
+            val cy = centerY(raw, line) ?: continue
+            if ((cy < EDGE || cy > 1f - EDGE) && keys.any { it.length >= 4 && k.contains(it) }) out.add(li)
         }
         return out
     }
@@ -142,18 +168,8 @@ class PdfDoc(private val ctx: Context, val file: File) {
         return if (n == 0) null else sum / n
     }
 
-    /** Lowercase letters with every run of digits as '#': "Page 12 · Smith" -> "page#smith". */
-    private fun key(sb: CharSequence, line: IntArray): String {
-        val out = StringBuilder()
-        for (k in line[0] until minOf(line[1], sb.length)) {
-            val c = sb[k]
-            when {
-                c.isDigit() -> if (out.isEmpty() || out.last() != '#') out.append('#')
-                c.isLetter() -> out.append(c.lowercaseChar())
-            }
-        }
-        return out.toString()
-    }
+    private fun key(sb: CharSequence, line: IntArray): String =
+        keyOf(sb.subSequence(line[0], minOf(line[1], sb.length)))
 
     private fun isPageNumber(k: String): Boolean =
         PAGE_NUMBER.matches(k) || (k.length <= 6 && ROMAN.matches(k))
@@ -318,6 +334,18 @@ class PdfDoc(private val ctx: Context, val file: File) {
     }
 
     companion object {
+        /** Lowercase letters with every run of digits as '#': "Page 12 · Smith" -> "page#smith". */
+        fun keyOf(s: CharSequence): String {
+            val out = StringBuilder()
+            for (c in s) {
+                when {
+                    c.isDigit() -> if (out.isEmpty() || out.last() != '#') out.append('#')
+                    c.isLetter() -> out.append(c.lowercaseChar())
+                }
+            }
+            return out.toString()
+        }
+
         private const val MIN_LETTERS = 20
         private const val CACHE_PAGES = 16
         private const val OCR_PX = 2200f

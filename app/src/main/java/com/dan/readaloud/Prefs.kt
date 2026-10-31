@@ -84,6 +84,16 @@ class Prefs(context: Context) {
         sp.edit().putString("pos:$path", "$page:$pos").apply()
     }
 
+    fun pdfSkips(path: String): Set<String> = sp.getStringSet("skip:$path", null)?.toSet() ?: emptySet()
+
+    fun addPdfSkip(path: String, key: String) {
+        sp.edit().putStringSet("skip:$path", pdfSkips(path) + key).apply()
+    }
+
+    fun clearPdfSkips(path: String) {
+        sp.edit().remove("skip:$path").apply()
+    }
+
     fun targets(): Set<String> =
         packages.split(',', ' ', '\n', ';')
             .map { it.trim() }

@@ -18,11 +18,14 @@ class PageView(ctx: Context) : View(ctx) {
     var sentence: List<RectF> = emptyList()
     var word: List<RectF> = emptyList()
     var onTap: ((Float, Float) -> Unit)? = null
+    var onLongPress: ((Float, Float) -> Unit)? = null
+    var marked: List<RectF> = emptyList()
 
     private val density = ctx.resources.displayMetrics.density
     private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val sentencePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x55FFD54F }
     private val wordPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x88FF9800.toInt() }
+    private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x66E53935 }
     private val src = Rect()
     private val dst = RectF()
     private val tmp = RectF()
@@ -32,6 +35,10 @@ class PageView(ctx: Context) : View(ctx) {
         override fun onSingleTapUp(e: MotionEvent): Boolean {
             if (width > 0 && height > 0) onTap?.invoke(e.x / width, e.y / height)
             return true
+        }
+
+        override fun onLongPress(e: MotionEvent) {
+            if (width > 0 && height > 0) onLongPress?.invoke(e.x / width, e.y / height)
         }
     })
 
@@ -51,6 +58,7 @@ class PageView(ctx: Context) : View(ctx) {
         val rad = 3f * density
         for (r in sentence) draw(canvas, r, sentencePaint, pad, rad)
         for (r in word) draw(canvas, r, wordPaint, pad, rad)
+        for (r in marked) draw(canvas, r, markPaint, pad, rad)
     }
 
     private fun draw(c: Canvas, r: RectF, p: Paint, pad: Float, rad: Float) {
