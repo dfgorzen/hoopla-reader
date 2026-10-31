@@ -60,6 +60,25 @@ class Prefs(context: Context) {
         get() = sp.getInt("ovY", -1)
         set(v) = sp.edit().putInt("ovY", v).apply()
 
+    var lastPdfPath: String?
+        get() = sp.getString("lastPdf", null)
+        set(v) = sp.edit().putString("lastPdf", v).apply()
+
+    var lastPdfTitle: String
+        get() = sp.getString("lastPdfTitle", "") ?: ""
+        set(v) = sp.edit().putString("lastPdfTitle", v).apply()
+
+    /** Saved (page, character) for a PDF file. */
+    fun pdfPosition(path: String): Pair<Int, Int> {
+        val s = sp.getString("pos:$path", null) ?: return 0 to 0
+        val parts = s.split(':')
+        return (parts.getOrNull(0)?.toIntOrNull() ?: 0) to (parts.getOrNull(1)?.toIntOrNull() ?: 0)
+    }
+
+    fun setPdfPosition(path: String, page: Int, pos: Int) {
+        sp.edit().putString("pos:$path", "$page:$pos").apply()
+    }
+
     fun targets(): Set<String> =
         packages.split(',', ' ', '\n', ';')
             .map { it.trim() }

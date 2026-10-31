@@ -27,6 +27,7 @@ import kotlin.math.roundToInt
 class MainActivity : Activity() {
     private lateinit var prefs: Prefs
     private lateinit var status: TextView
+    private lateinit var continuePdf: Button
     private var testTts: TextToSpeech? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,6 +61,15 @@ class MainActivity : Activity() {
         })
         col.addView(button("2. Text-to-speech engine & voice") { openTtsSettings() })
         col.addView(button("Test voice") { testVoice() })
+
+        col.addView(heading("PDFs", 18f))
+        col.addView(button("Open a PDF…") {
+            val pick = Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/pdf")
+            startActivityForResult(pick, REQ_PDF)
+        })
+        continuePdf = button("Continue last PDF") { startActivity(Intent(this, PdfActivity::class.java)) }
+        col.addView(continuePdf)
+        col.addView(note("You can also Share a PDF to Read Aloud, or choose Read Aloud in \"Open with\". It keeps reading with the screen off; pause from the notification. Tap a sentence on the page to read from there."))
 
         col.addView(heading("Reading", 18f))
         col.addView(slider("Speech rate", 50, 300, (prefs.speechRate * 100).roundToInt(),
@@ -133,6 +143,20 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refreshStatus()
+        val last = prefs.lastPdfPath
+        continuePdf.visibility = if (last != null && java.io.File(last).exists()) View.VISIBLE else View.GONE
+        continuePdf.text = "Continue: ${prefs.lastPdfTitle.ifEmpty { "last PDF" }}"
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data
+        if (requestCode == REQ_PDF && resultCode == RESULT_OK && uri != null) {
+            startActivity(
+                Intent(this, PdfActivity::class.java).setData(uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            )
+        }
     }
 
     override fun onDestroy() {
@@ -238,5 +262,9 @@ class MainActivity : Activity() {
         box.addView(tv)
         box.addView(sb)
         return box
+    }
+
+    companion object {
+        private const val REQ_PDF = 41
     }
 }

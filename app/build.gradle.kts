@@ -16,6 +16,15 @@ android {
         targetSdk = 35
         versionCode = runNumber
         versionName = "1.0.$runNumber"
+        ndk {
+            abiFilters.add("arm64-v8a")   // Pixel; keeps the OCR library small
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*")
+        }
     }
 
     signingConfigs {
@@ -51,4 +60,9 @@ android {
         checkReleaseBuilds = false
         abortOnError = false
     }
+}
+
+dependencies {
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")   // PDF text with positions
+    implementation("com.google.mlkit:text-recognition:16.0.0")  // on-device OCR, no Google services needed
 }
