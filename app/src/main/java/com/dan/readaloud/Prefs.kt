@@ -60,6 +60,11 @@ class Prefs(context: Context) {
         get() = sp.getInt("ovY", -1)
         set(v) = sp.edit().putInt("ovY", v).apply()
 
+    /** PDFs: skip running headers/footers (title, author, page numbers). */
+    var pdfSkipHeads: Boolean
+        get() = sp.getBoolean("pdfHeads", true)
+        set(v) = sp.edit().putBoolean("pdfHeads", v).apply()
+
     var lastPdfPath: String?
         get() = sp.getString("lastPdf", null)
         set(v) = sp.edit().putString("lastPdf", v).apply()

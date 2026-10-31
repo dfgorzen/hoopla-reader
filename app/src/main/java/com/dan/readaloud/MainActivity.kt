@@ -71,6 +71,14 @@ class MainActivity : Activity() {
         col.addView(continuePdf)
         col.addView(note("You can also Share a PDF to Read Aloud, or choose Read Aloud in \"Open with\". It keeps reading with the screen off; pause from the notification. Tap a sentence on the page to read from there."))
 
+        col.addView(Switch(this).apply {
+            text = "Skip headers, footers and page numbers in PDFs"
+            isChecked = prefs.pdfSkipHeads
+            setPadding(0, dp(8), 0, dp(4))
+            setOnCheckedChangeListener { _, on -> prefs.pdfSkipHeads = on }
+        })
+        col.addView(note("Leaves out lines at the top or bottom of a page that repeat on nearby pages (book title, author) and bare page numbers. Takes effect the next time a PDF is opened."))
+
         col.addView(heading("Reading", 18f))
         col.addView(slider("Speech rate", 50, 300, (prefs.speechRate * 100).roundToInt(),
             { String.format("%.2f×", it / 100f) }) { prefs.speechRate = it / 100f })

@@ -23,23 +23,34 @@ class PdfPage(val text: String, val boxes: List<RectF?>, val ocr: Boolean)
 
 /**
  * A PDF file: text extraction with PDFBox (with character positions), falling back to
- * on-device OCR for pages that are only images. Every method blocks; call them from one
- * background thread.
+ * on-device OCR for pages that are only images. Running headers/footers (title, author,
+ * page numbers repeated on every page) are removed. Every method blocks; call them from
+ * one background thread.
  */
 class PdfDoc(private val ctx: Context, val file: File) {
+    /** Text as extracted, with line boundaries, before any filtering. */
+    private class RawPage(val sb: CharSequence, val boxes: List<RectF?>, val lines: List<IntArray>, val ocr: Boolean) {
+        val letters = sb.count { it.isLetter() }
+    }
+
     private var pd: PDDocument? = null
     private var pfd: ParcelFileDescriptor? = null
     private var renderer: PdfRenderer? = null
     private var recognizer: TextRecognizer? = null
     private val cache = HashMap<Int, PdfPage>()
     private val order = ArrayDeque<Int>()
+    private val rawCache = HashMap<Int, RawPage>()
+    private val rawOrder = ArrayDeque<Int>()
+    private val edgeCache = HashMap<Int, Set<String>>()
 
     var pageCount = 0
         private set
 
-    /** Ignore text in the top/bottom of each page (running headers, page numbers). */
+    /** Hard cut: ignore text in the top/bottom N% of each page. */
     @Volatile var topPct = 6
     @Volatile var bottomPct = 6
+    /** Drop lines near the top/bottom that repeat on nearby pages, and bare page numbers. */
+    @Volatile var dropRunningHeads = true
 
     /** Opens the file. Returns an error message, or null on success. */
     fun open(): String? {
@@ -73,30 +84,112 @@ class PdfDoc(private val ctx: Context, val file: File) {
 
     fun page(i: Int): PdfPage {
         cache[i]?.let { return it }
-        var p = try { extractText(i) } catch (_: Exception) { PdfPage("", emptyList(), false) }
-        if (letters(p.text) < MIN_LETTERS) {
-            val o = try { ocr(i) } catch (_: Exception) { null }
-            if (o != null && letters(o.text) > letters(p.text)) p = o
-        }
+        val raw = raw(i)
+        val drop = if (dropRunningHeads) runningHeads(i, raw) else emptySet()
+        val p = build(raw, drop)
         cache[i] = p
         order.addLast(i)
         while (order.size > CACHE_PAGES) cache.remove(order.removeFirst())
         return p
     }
 
-    private fun letters(s: String) = s.count { it.isLetter() }
+    // ---- running header/footer detection ----
 
-    private fun extractText(i: Int): PdfPage {
-        val doc = pd ?: return PdfPage("", emptyList(), false)
+    /** Indices (into raw.lines) of header/footer lines on page i. */
+    private fun runningHeads(i: Int, raw: RawPage): Set<Int> {
+        val out = HashSet<Int>()
+        var neighbours: List<Set<String>>? = null
+        for ((li, line) in raw.lines.withIndex()) {
+            val cy = centerY(raw, line) ?: continue
+            if (cy > EDGE && cy < 1f - EDGE) continue
+            val k = key(raw.sb, line)
+            if (k.isEmpty()) continue
+            if (isPageNumber(k)) { out.add(li); continue }
+            if (k.length < 3) continue
+            val nb = neighbours ?: ((i - NEIGHBOURS)..(i + NEIGHBOURS))
+                .filter { it != i && it in 0 until pageCount }
+                .map { edgeKeys(it) }
+                .also { neighbours = it }
+            if (nb.any { k in it }) out.add(li)
+        }
+        return out
+    }
+
+    /** Keys of the lines near the top/bottom of page j. */
+    private fun edgeKeys(j: Int): Set<String> {
+        edgeCache[j]?.let { return it }
+        val raw = try { raw(j) } catch (_: Exception) { null }
+        val keys = HashSet<String>()
+        if (raw != null) {
+            for (line in raw.lines) {
+                val cy = centerY(raw, line) ?: continue
+                if (cy > EDGE && cy < 1f - EDGE) continue
+                val k = key(raw.sb, line)
+                if (k.length >= 3) keys.add(k)
+            }
+        }
+        edgeCache[j] = keys
+        return keys
+    }
+
+    private fun centerY(raw: RawPage, line: IntArray): Float? {
+        var sum = 0f
+        var n = 0
+        for (k in line[0] until minOf(line[1], raw.boxes.size)) {
+            val b = raw.boxes[k] ?: continue
+            sum += b.centerY(); n++
+        }
+        return if (n == 0) null else sum / n
+    }
+
+    /** Lowercase letters with every run of digits as '#': "Page 12 · Smith" -> "page#smith". */
+    private fun key(sb: CharSequence, line: IntArray): String {
+        val out = StringBuilder()
+        for (k in line[0] until minOf(line[1], sb.length)) {
+            val c = sb[k]
+            when {
+                c.isDigit() -> if (out.isEmpty() || out.last() != '#') out.append('#')
+                c.isLetter() -> out.append(c.lowercaseChar())
+            }
+        }
+        return out.toString()
+    }
+
+    private fun isPageNumber(k: String): Boolean =
+        PAGE_NUMBER.matches(k) || (k.length <= 6 && ROMAN.matches(k))
+
+    // ---- extraction ----
+
+    private fun raw(i: Int): RawPage {
+        rawCache[i]?.let { return it }
+        var r = try { extractText(i) } catch (_: Exception) { RawPage("", emptyList(), emptyList(), false) }
+        if (r.letters < MIN_LETTERS) {
+            val o = try { ocr(i) } catch (_: Exception) { null }
+            if (o != null && o.letters > r.letters) r = o
+        }
+        rawCache[i] = r
+        rawOrder.addLast(i)
+        while (rawOrder.size > CACHE_PAGES) rawCache.remove(rawOrder.removeFirst())
+        return r
+    }
+
+    private fun extractText(i: Int): RawPage {
+        val empty = RawPage("", emptyList(), emptyList(), false)
+        val doc = pd ?: return empty
         val pg = doc.getPage(i)
         val crop = pg.cropBox
         val rot = ((pg.rotation % 360) + 360) % 360
         val w = if (rot == 90 || rot == 270) crop.height else crop.width
         val h = if (rot == 90 || rot == 270) crop.width else crop.height
-        if (w <= 0f || h <= 0f) return PdfPage("", emptyList(), false)
+        if (w <= 0f || h <= 0f) return empty
 
         val sb = StringBuilder()
         val boxes = ArrayList<RectF?>()
+        val lines = ArrayList<IntArray>()
+        var lineStart = 0
+        fun endLine() {
+            if (sb.length > lineStart) lines.add(intArrayOf(lineStart, sb.length))
+        }
         val stripper = object : PDFTextStripper() {
             override fun writeString(text: String?, textPositions: MutableList<TextPosition>?) {
                 for (tp in textPositions ?: return) {
@@ -119,27 +212,34 @@ class PdfDoc(private val ctx: Context, val file: File) {
             }
 
             override fun writeLineSeparator() {
-                // Join words hyphenated across a line break ("exam-" + "ple").
                 val n = sb.length
+                // Join words hyphenated across a line break ("exam-" + "ple").
                 if (n >= 2 && sb[n - 1] == '-' && sb[n - 2].isLetter()) {
                     sb.setLength(n - 1); boxes.removeAt(boxes.size - 1)
+                    endLine()
+                    lineStart = sb.length
                     return
                 }
+                endLine()
                 sb.append(' '); boxes.add(null)
+                lineStart = sb.length
             }
 
             override fun writeParagraphEnd() {
+                endLine()
                 sb.append('\n'); boxes.add(null)
+                lineStart = sb.length
             }
         }
         stripper.setSortByPosition(true)
         stripper.setStartPage(i + 1)
         stripper.setEndPage(i + 1)
         stripper.getText(doc)
-        return build(sb, boxes, false)
+        endLine()
+        return RawPage(sb, boxes, lines, false)
     }
 
-    private fun ocr(i: Int): PdfPage? {
+    private fun ocr(i: Int): RawPage? {
         val r = renderer ?: return null
         val bmp: Bitmap
         val page = r.openPage(i)
@@ -162,8 +262,10 @@ class PdfDoc(private val ctx: Context, val file: File) {
 
         val sb = StringBuilder()
         val boxes = ArrayList<RectF?>()
+        val lines = ArrayList<IntArray>()
         for (block in result.textBlocks) {
             for (line in block.lines) {
+                val start = sb.length
                 for (el in line.elements) {
                     val t = el.text
                     val bb = el.boundingBox
@@ -178,14 +280,22 @@ class PdfDoc(private val ctx: Context, val file: File) {
                     }
                     sb.append(' '); boxes.add(null)
                 }
+                if (sb.length > start) lines.add(intArrayOf(start, sb.length))
             }
             sb.append('\n'); boxes.add(null)
         }
-        return build(sb, boxes, true)
+        return RawPage(sb, boxes, lines, true)
     }
 
     /** Drops header/footer text and normalises spacing into a PageBuffer. */
-    private fun build(sb: CharSequence, boxes: List<RectF?>, ocr: Boolean): PdfPage {
+    private fun build(raw: RawPage, dropLines: Set<Int>): PdfPage {
+        val sb = raw.sb
+        val boxes = raw.boxes
+        val dropped = BooleanArray(sb.length)
+        for (li in dropLines) {
+            val l = raw.lines.getOrNull(li) ?: continue
+            for (k in l[0] until minOf(l[1], sb.length)) dropped[k] = true
+        }
         val top = topPct / 100f
         val bottom = 1f - bottomPct / 100f
         val buf = PageBuffer()
@@ -198,17 +308,24 @@ class PdfDoc(private val ctx: Context, val file: File) {
         for (k in 0 until minOf(sb.length, boxes.size)) {
             val c = sb[k]
             val b = boxes[k]
+            if (dropped[k]) continue
             if (c == '\n') { flush(); buf.blockBreak(); continue }
             if (b != null && (b.centerY() < top || b.centerY() > bottom)) continue
             run.append(c); runBoxes.add(b)
         }
         flush()
-        return PdfPage(buf.text(), ArrayList(buf.rects), ocr)
+        return PdfPage(buf.text(), ArrayList(buf.rects), raw.ocr)
     }
 
     companion object {
         private const val MIN_LETTERS = 20
-        private const val CACHE_PAGES = 12
+        private const val CACHE_PAGES = 16
         private const val OCR_PX = 2200f
+        /** Header/footer zone: top and bottom 12% of the page. */
+        private const val EDGE = 0.12f
+        /** Compare with this many pages on each side (2 covers alternating title/author heads). */
+        private const val NEIGHBOURS = 2
+        private val PAGE_NUMBER = Regex("^(page|p)?#((of)?#)?$")
+        private val ROMAN = Regex("^(?=.)c{0,3}(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})$")
     }
 }

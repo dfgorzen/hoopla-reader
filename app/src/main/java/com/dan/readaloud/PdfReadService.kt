@@ -154,6 +154,7 @@ class PdfReadService : Service(), Speaker.Listener {
             val d = PdfDoc(applicationContext, file)
             d.topPct = prefs.topMarginPct
             d.bottomPct = prefs.bottomMarginPct
+            d.dropRunningHeads = prefs.pdfSkipHeads
             val err = d.open()
             main.post {
                 if (token != loadToken) {
